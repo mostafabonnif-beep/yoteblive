@@ -1,0 +1,14 @@
+services:
+  live-relay:
+    build: .
+    container_name: youtube-live-relay
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7861:7861"
+    environment:
+      # فعّل رمز الحماية إذا فتحت المنفذ على الشبكة
+      PANEL_TOKEN: ${PANEL_TOKEN:-}
+      # STREAM_KEYS: "key1,key2"
+      LOG_LEVEL: INFO
+    volumes:
+      - ./data:/app/data

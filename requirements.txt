@@ -1,0 +1,2 @@
+yt-dlp>=2026.2.4
+imageio-ffmpeg>=0.6.0

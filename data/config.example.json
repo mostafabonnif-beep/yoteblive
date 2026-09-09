@@ -1,0 +1,20 @@
+{
+  "source_url": "https://www.youtube.com/channel/UCAeyha98k-qVLZkbnwaTB9w/live",
+  "backup_sources": [],
+  "rtmp_base": "rtmp://a.rtmp.youtube.com/live2",
+  "stream_keys": [],
+  "resolution": "1280x720",
+  "fps": 30,
+  "preset": "veryfast",
+  "video_bitrate": "3000k",
+  "audio_bitrate": "160k",
+  "reconnect_delay": 10,
+  "max_reconnect_delay": 60,
+  "health_timeout": 45,
+  "stall_timeout": 15,
+  "max_session_minutes": 120,
+  "cookies_from_browser": "",
+  "cookiefile": "",
+  "auto_start": false,
+  "proxy": ""
+}

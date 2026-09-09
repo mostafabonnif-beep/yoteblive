@@ -1,0 +1,22 @@
+# انسخ الملف إلى /etc/systemd/system/live-relay.service ثم:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now live-relay
+[Unit]
+Description=YouTube Live Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+WorkingDirectory=/opt/youtube-live-relay
+Environment=HOST=127.0.0.1 PORT=7861 LOG_LEVEL=INFO
+# Environment=PANEL_TOKEN=ضع-رمزاً-قوياً-هنا
+ExecStart=/usr/bin/python3 /opt/youtube-live-relay/app.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/opt/youtube-live-relay/data
+
+[Install]
+WantedBy=multi-user.target
