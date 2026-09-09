@@ -16,5 +16,17 @@
   "cookies_from_browser": "",
   "cookiefile": "",
   "auto_start": false,
-  "proxy": ""
+  "proxy": "",
+  "logo_path": "",
+  "logo_position": "br",
+  "logo_width": 0,
+  "logo_opacity": 1.0,
+  "logo_mode": "off",
+  "logo_show": 12,
+  "logo_hide": 40,
+  "pip_slots": [],
+  "break_enabled": true,
+  "break_image": "",
+  "break_text": "سنعود قريباً",
+  "break_audio": ""
 }

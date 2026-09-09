@@ -420,6 +420,115 @@ class TestProxyAndCheckHelpers:
         assert result["frames"] == 0
 
 
+
+class TestGraphicsV9:
+    """اختبارات طبقة الرسوم v9: شعار، منافذ PiP، شاشة استراحة."""
+
+    def setup_method(self):
+        app.FFMPEG = "/usr/bin/ffmpeg"
+
+    def _cfg(self, **over):
+        data = {
+            "source_url": "https://example.com/live",
+            "rtmp_base": "rtmp://example.com/live",
+            "stream_keys": ["k"],
+            "resolution": "640x360",
+            "fps": 10,
+            "logo_path": "/tmp/logo.png",
+            "logo_position": "tr",
+            "logo_mode": "always",
+        }
+        data.update(over)
+        return app.RelayConfig.from_dict(data)
+
+    def test_sanitizers(self):
+        assert app.sanitize_position("BR") == "br"
+        assert app.sanitize_position("bad") == "br"
+        assert app.sanitize_mode("PERIODIC") == "periodic"
+        assert app.sanitize_mode("x") == "off"
+        slots = app.sanitize_pip_slots([{"name": "ع", "path": "/tmp/x.png", "position": "bl", "width": 50, "mode": "always"}, {"path": ""}, "bad"])
+        assert len(slots) == 1
+        assert slots[0]["width"] == 120  # الحد الأدنى
+        assert slots[0]["mode"] == "always"
+        assert slots[0]["position"] == "bl"
+        # حد أقصى 3 منافذ
+        many = [{"path": f"/tmp/{i}.png"} for i in range(6)]
+        assert len(app.sanitize_pip_slots(many)) == 3
+
+    def test_config_defaults(self):
+        cfg = self._cfg(logo_path="", logo_mode="off", pip_slots=None)
+        assert cfg.logo_mode == "off"
+        assert cfg.pip_slots == []
+        assert cfg.break_enabled is True
+        assert cfg.break_text == "سنعود قريباً"
+
+    def test_overlay_enable_periodic(self):
+        assert app.overlay_enable("periodic", 2, 3) == "enable='lt(mod(t,5),2)'"
+        assert app.overlay_enable("always", 2, 3) == ""
+
+    def test_pipeline_none_when_disabled(self):
+        src = app.SourceSelection(mode="split", video_url="http://v", audio_url="http://a")
+        cfg = self._cfg(logo_path="", logo_mode="off")
+        assert app.graphics_pipeline(cfg, src, 640, 360, 10) is None
+
+    def test_pipeline_split_indices_and_logo(self):
+        src = app.SourceSelection(mode="split", video_url="http://v", audio_url="http://a")
+        cfg = self._cfg(logo_mode="always")
+        extra, graph = app.graphics_pipeline(cfg, src, 640, 360, 10)
+        assert extra.count("-i") == 1  # الشعار فقط
+        assert "[2:v]" in graph      # بعد الفيديو (0) والصوت (1)
+        assert "overlay=W-w-10:10" in graph  # أعلى يمين
+        assert "format=yuv420p[vout]" in graph
+
+    def test_pipeline_pip_periodic(self):
+        src = app.SourceSelection(mode="split", video_url="http://v", audio_url="http://a")
+        cfg = self._cfg(logo_path="", pip_slots=[{"name": "x", "path": "/tmp/r.png", "position": "br", "width": 300, "mode": "periodic", "show": 2, "hide": 2}])
+        extra, graph = app.graphics_pipeline(cfg, src, 640, 360, 10)
+        assert extra.count("-i") == 1
+        assert "[2:v]" in graph and "enable='lt(mod(t,4),2)'" in graph
+        assert "overlay=W-w-10:H-h-10" in graph
+
+    def test_pipeline_muxed_index(self):
+        src = app.SourceSelection(mode="muxed", video_url="http://v")
+        cfg = self._cfg(logo_mode="always")
+        extra, graph = app.graphics_pipeline(cfg, src, 640, 360, 10)
+        assert "[1:v]" in graph  # مدخل واحد فقط قبله
+
+    def test_break_command_structure(self):
+        cfg = self._cfg(logo_path="", logo_mode="off")
+        cmd = app.build_break_command(cfg, "rtmp://out/key")
+        joined = " ".join(cmd)
+        assert "anullsrc" in joined
+        assert "drawtext" in joined and "fontfile=" in joined
+        assert cmd[-1] == "rtmp://out/key"
+        assert joined.endswith("-f flv rtmp://out/key")
+        # كل المدخلات قبل -filter_complex (ترتيب ffmpeg سليم)
+        last_i = max(i for i, t in enumerate(cmd) if t == "-i")
+        fc = cmd.index("-filter_complex")
+        assert fc > last_i
+        assert "NotoSansArabic" in joined
+
+    def test_break_command_with_assets(self, tmp_path):
+        bg = tmp_path / "bg.png"
+        bg.write_bytes(b"png")
+        audio = tmp_path / "m.mp3"
+        audio.write_bytes(b"mp3")
+        logo = tmp_path / "logo.png"
+        logo.write_bytes(b"png")
+        cfg = self._cfg(logo_path=str(logo), logo_mode="always",
+                        break_image=str(bg), break_audio=str(audio),
+                        pip_slots=[])
+        cmd = app.build_break_command(cfg, "rtmp://out/key")
+        joined = " ".join(cmd)
+        assert str(bg) in joined and str(audio) in joined and str(logo) in joined
+        assert "anullsrc" not in joined
+
+    def test_public_config_includes_graphics(self):
+        public = app.public_config(self._cfg())
+        assert "logo_path" in public and public["logo_mode"] == "always"
+        assert "break_text" in public
+
+
 class TestPanelTokenAndLogLevel:
     def test_panel_token_parsed(self):
         cfg = make_config(panel_token=" secret123 ")

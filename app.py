@@ -47,6 +47,19 @@ DEFAULTS = {
     "cookies_from_browser": "",
     "cookiefile": "",
     "proxy": "",
+    # ---- طبقة الرسوم (v9) ----
+    "logo_path": "",
+    "logo_position": "br",
+    "logo_width": 0,
+    "logo_opacity": 1.0,
+    "logo_mode": "off",
+    "logo_show": 12,
+    "logo_hide": 40,
+    "pip_slots": [],
+    "break_enabled": True,
+    "break_image": "",
+    "break_text": "سنعود قريباً",
+    "break_audio": "",
     "auto_start": False,
     "notify_webhook": "",
     "panel_token": "",
@@ -93,6 +106,18 @@ class RelayConfig:
     cookies_from_browser: str = ""
     cookiefile: str = ""
     proxy: str = ""
+    logo_path: str = ""
+    logo_position: str = "br"
+    logo_width: int = 0
+    logo_opacity: float = 1.0
+    logo_mode: str = "off"
+    logo_show: int = 12
+    logo_hide: int = 40
+    pip_slots: list[dict[str, Any]] = field(default_factory=list)
+    break_enabled: bool = True
+    break_image: str = ""
+    break_text: str = "سنعود قريباً"
+    break_audio: str = ""
     auto_start: bool = False
     notify_webhook: str = ""
     panel_token: str = ""
@@ -201,6 +226,18 @@ class RelayConfig:
             cookies_from_browser=str(data.get("cookies_from_browser", "")).strip(),
             cookiefile=str(data.get("cookiefile", "")).strip(),
             proxy=parse_proxy(data.get("proxy", "")),
+            logo_path=str(data.get("logo_path", "")).strip(),
+            logo_position=sanitize_position(data.get("logo_position", "br"), "br"),
+            logo_width=max(0, min(2000, int(number(data.get("logo_width", 0))))),
+            logo_opacity=max(0.0, min(1.0, float(number(data.get("logo_opacity", 1.0), 1.0)))),
+            logo_mode=sanitize_mode(data.get("logo_mode", "off")),
+            logo_show=max(1, min(3600, int(number(data.get("logo_show", 12), 12)))),
+            logo_hide=max(1, min(3600, int(number(data.get("logo_hide", 40), 40)))),
+            pip_slots=sanitize_pip_slots(data.get("pip_slots", [])),
+            break_enabled=bool(data.get("break_enabled", True)),
+            break_image=str(data.get("break_image", "")).strip(),
+            break_text=str(data.get("break_text", "سنعود قريباً")).strip() or "سنعود قريباً",
+            break_audio=str(data.get("break_audio", "")).strip(),
             auto_start=bool(data.get("auto_start", False)),
             notify_webhook=str(data.get("notify_webhook", "")).strip(),
             panel_token=str(data.get("panel_token", "")).strip(),
@@ -254,6 +291,7 @@ class WorkerStatus:
     stats_frame: int = 0
     stats_out_time: str = ""
     http_403_count: int = 0
+    fallback_running: bool = False
 
 
 def proxy_env(config: "RelayConfig") -> Optional[dict[str, str]]:
@@ -653,6 +691,43 @@ class Notifier:
 NOTIFIER = Notifier()
 
 
+POSITIONS = {"tl", "tr", "bl", "br", "center"}
+MODES = {"off", "always", "periodic"}
+
+
+def sanitize_position(raw: Any, default: str = "br") -> str:
+    value = str(raw or "").strip().lower()
+    return value if value in POSITIONS else default
+
+
+def sanitize_mode(raw: Any, default: str = "off") -> str:
+    value = str(raw or "").strip().lower()
+    return value if value in MODES else default
+
+
+def sanitize_pip_slots(raw: Any) -> list[dict[str, Any]]:
+    """يعيد قائمة منافذ PiP نظيفة: الاسم/المسار/الموضع/العرض/الوضع/المدد."""
+    slots: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return slots
+    for item in raw[:3]:
+        if not isinstance(item, dict):
+            continue
+        path_value = str(item.get("path") or "").strip()
+        if not path_value:
+            continue
+        slots.append({
+            "name": str(item.get("name") or "عرض").strip()[:30] or "عرض",
+            "path": path_value,
+            "position": sanitize_position(item.get("position"), "br"),
+            "width": max(120, min(1600, int(number(item.get("width", 480), 480)))),
+            "mode": sanitize_mode(item.get("mode"), "off"),
+            "show": max(1, min(3600, int(number(item.get("show", 20), 20)))),
+            "hide": max(1, min(3600, int(number(item.get("hide", 30), 30)))),
+        })
+    return slots
+
+
 def headers_value(headers: dict[str, str]) -> str:
     allowed = {"user-agent", "referer", "origin", "cookie", "accept-language"}
     result = []
@@ -688,13 +763,169 @@ def input_options(url: str, headers: dict[str, str]) -> list[str]:
     return args
 
 
+# ============================= طبقة الرسوم v9 =============================
+MEDIA_DIR = APP_DIR / "media"
+FONT_DIR = MEDIA_DIR / "fonts"
+ARABIC_FONT = FONT_DIR / "NotoSansArabic-Bold.ttf"
+
+POS_XY = {
+    "tl": ("10", "10"),
+    "tr": ("W-w-10", "10"),
+    "bl": ("10", "H-h-10"),
+    "br": ("W-w-10", "H-h-10"),
+    "center": ("(W-w)/2", "(H-h)/2"),
+}
+
+
+def overlay_enable(mode: str, show: int, hide: int) -> str:
+    """تعليمة enable للطبقة: off/always/periodic (تظهر show ثانية كل show+hide)."""
+    if mode == "periodic":
+        total = max(2, show + hide)
+        return f"enable='lt(mod(t,{total}),{show})'"
+    return ""
+
+
+def file_input_args(path: str, is_video: bool, loop: bool = True) -> list[str]:
+    args: list[str] = []
+    if not is_video:
+        args.extend(["-loop", "1", "-framerate", "30"])
+    elif loop:
+        args.extend(["-stream_loop", "-1", "-re"])
+    args.extend(["-i", path])
+    return args
+
+
+def graphics_pipeline(config: RelayConfig, source: SourceSelection, width: int, height: int, fps: int) -> Optional[tuple[list[str], str]]:
+    """يبني مدخلات إضافية + filter_complex لطبقة الشعار ومنافذ PiP.
+
+    يعيد None إذا لم تكن هناك أي طبقة مفعلة (يبقى المسار القديم البسيط).
+    المدخلات: 0 = الفيديو (و1 = الصوت في split/video-only) ثم تُلحق مدخلات الرسوم.
+    """
+    extra: list[str] = []
+    parts: list[str] = []
+    # مدخلات الأساس: 0=فيديو (+1=صوت في split/video-only)؛ الرسوم تُلحق بعدها
+    slot_idx = 2 if source.mode in {"split", "video-only"} else 1
+    label = "bg"
+    base_first = True
+
+    logo_on = config.logo_path and config.logo_mode != "off"
+    pips = [p for p in config.pip_slots if p.get("path") and p.get("mode") != "off"]
+    if not logo_on and not pips:
+        return None
+
+    # الأساس: نفس التحجيم القديم
+    scale_base = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                  f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps},format=yuv420p")
+    if logo_on:
+        idx = slot_idx
+        slot_idx += 1
+        extra.extend(file_input_args(config.logo_path, is_video=False))
+        lw = config.logo_width or 220
+        pos_x, pos_y = POS_XY.get(config.logo_position, POS_XY["br"])
+        parts.append(f"[{idx}:v]scale='min({lw}\\,iw)':-2,format=rgba,fps={fps}[logo]")
+        enable = overlay_enable(config.logo_mode, config.logo_show, config.logo_hide)
+        if enable:
+            parts.append(f"[{label}][logo]overlay={pos_x}:{pos_y}:{enable}[l1]")
+            label = "l1"
+        else:
+            parts.append(f"[{label}][logo]overlay={pos_x}:{pos_y}[l1]")
+            label = "l1"
+        base_first = False
+
+    for pip in pips:
+        idx = slot_idx
+        slot_idx += 1
+        is_video = pip["path"].lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".ts", ".avi"))
+        extra.extend(file_input_args(pip["path"], is_video=is_video))
+        pv = f"[{idx}:v]scale='min({pip['width']}\\,iw)':-2,format=rgba,fps={fps}[p{idx}]"
+        parts.append(pv)
+        pos_x, pos_y = POS_XY.get(pip.get("position"), POS_XY["br"])
+        enable = overlay_enable(pip.get("mode", "off"), int(pip.get("show", 20)), int(pip.get("hide", 30)))
+        name = label if not base_first else label
+        out_label = f"p{idx}"
+        if enable:
+            parts.append(f"[{name}][p{idx}]overlay={pos_x}:{pos_y}:{enable}[{out_label}]")
+        else:
+            parts.append(f"[{name}][p{idx}]overlay={pos_x}:{pos_y}[{out_label}]")
+        label = out_label
+        base_first = False
+
+    graph_parts = [f"[0:v]{scale_base}[bg]"] + parts
+    graph_parts.append(f"[{label}]format=yuv420p[vout]")
+    return extra, ";".join(graph_parts)
+
+
+def build_break_command(config: RelayConfig, output_url: str) -> list[str]:
+    """شاشة «سنعود قريباً» — محتوى محلي بالكامل (خلفية + صورة + نص عربي + شعار + صوت).
+
+    تعمل حتى لو كان IP الخادم محجوباً لدى يوتيوب لأنها لا تجلب شيئاً من الإنترنت.
+    ترتيب المدخلات: 0=خلفية ملونة، 1=صورة اختيارية، 2=شعار اختياري، ثم الصوت أخيراً.
+    """
+    if not FFMPEG:
+        raise RuntimeError("ffmpeg غير جاهز")
+    width, height = (int(part) for part in config.resolution.split("x", 1))
+    fps = config.fps
+    cmd: list[str] = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostdin", "-nostats"]
+    cmd.extend(["-f", "lavfi", "-i", f"color=c=0x0c1322:s={width}x{height}:r={fps}"])
+    next_input = 1
+    graph: list[str] = [f"[0:v]format=yuv420p[base]"]
+    cur = "base"
+
+    img = config.break_image
+    if img and Path(img).exists():
+        cmd.extend(["-loop", "1", "-framerate", str(fps), "-i", img])
+        graph.append(f"[{next_input}:v]scale='min({width}\\,iw)':-2,format=rgb24[bgi]")
+        graph.append(f"[{cur}][bgi]overlay=(W-w)/2:(H-h)/2-170[b1]")
+        cur = "b1"
+        next_input += 1
+
+    if Path(ARABIC_FONT).exists():
+        text = config.break_text or "سنعود قريباً"
+        graph.append(
+            f"[{cur}]drawtext=fontfile='{ARABIC_FONT}':text='{text}':"
+            f"fontcolor=white@0.95:fontsize=52:x=(w-text_w)/2:y=(h-text_h)/2+60:"
+            f"shadowcolor=black@0.6:shadowx=2:shadowy=2[txt]"
+        )
+        cur = "txt"
+    else:
+        LOGGER.warning("الخط العربي غير موجود في media/fonts — شاشة الاستراحة بلا نص")
+
+    if config.logo_path and Path(config.logo_path).exists():
+        cmd.extend(["-loop", "1", "-framerate", str(fps), "-i", config.logo_path])
+        graph.append(f"[{next_input}:v]scale='min(150\\,iw)':-2,format=rgba[lgb]")
+        graph.append(f"[{cur}][lgb]overlay=W-w-24:H-h-24[l2]")
+        cur = "l2"
+        next_input += 1
+
+    graph.append(f"[{cur}]format=yuv420p[vout]")
+
+    if config.break_audio and Path(config.break_audio).exists():
+        cmd.extend(["-stream_loop", "-1", "-i", config.break_audio])
+    else:
+        cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"])
+    # كل خيارات الخرج بعد جميع المدخلات (ترتيب ffmpeg الصحيح)
+    cmd.extend(["-filter_complex", ";".join(graph), "-map", "[vout]", "-map", f"{next_input}:a:0"])
+    cmd.extend([
+        "-c:v", "libx264", "-preset", config.preset, "-tune", "zerolatency",
+        "-profile:v", "main", "-b:v", config.video_bitrate,
+        "-maxrate", config.video_bitrate,
+        "-bufsize", str(max(2000, int(number(re.sub(r"[^0-9.]", "", config.video_bitrate), 3000) * 2))) + "k",
+        "-pix_fmt", "yuv420p", "-r", str(fps),
+        "-g", str(fps * 2), "-keyint_min", str(fps * 2), "-sc_threshold", "0",
+        "-c:a", "aac", "-b:a", config.audio_bitrate, "-ar", "44100", "-ac", "2",
+        "-max_muxing_queue_size", "4096", "-flvflags", "no_duration_filesize",
+        "-f", "flv", output_url,
+    ])
+    return cmd
+
+
 def build_ffmpeg_command(source: SourceSelection, output_url: str, config: RelayConfig) -> list[str]:
     if not FFMPEG:
         raise RuntimeError("ffmpeg غير جاهز")
     width, height = (int(part) for part in config.resolution.split("x", 1))
     fps = config.fps
     scale = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps}"
-    command = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostdin", "-nostats", "-progress", "pipe:1", "-stats_period", "2"]
+    command: list[str] = [FFMPEG, "-hide_banner", "-loglevel", "warning", "-nostdin", "-nostats", "-progress", "pipe:1", "-stats_period", "2"]
     if source.mode == "split":
         command.extend(input_options(source.video_url, source.video_headers))
         command.extend(input_options(source.audio_url or "", source.audio_headers))
@@ -710,14 +941,18 @@ def build_ffmpeg_command(source: SourceSelection, output_url: str, config: Relay
             # إذا لم يوجد الصوت فعلاً في الحاوية، يخرج ffmpeg بخطأ وتُعاد المحاولة
             # تلقائياً بمسار صوت منفصل بدل إرسال بث بلا صوت بصمت.
             audio_index = "0:a:0"
+    # ---- طبقة الرسوم v9: شعار + منافذ PiP (عند تفعيل أي منها) ----
+    gfx = graphics_pipeline(config, source, width, height, fps)
+    if gfx is not None:
+        extra_inputs, filter_graph = gfx
+        command.extend(extra_inputs)
+        command.extend(["-filter_complex", filter_graph, "-map", "[vout]"])
+    else:
+        command.extend(["-map", video_index, "-vf", scale])
     command.extend(
         [
             "-map",
-            video_index,
-            "-map",
             audio_index,
-            "-vf",
-            scale,
             "-c:v",
             "libx264",
             "-preset",
@@ -790,6 +1025,8 @@ class RelayWorker(threading.Thread):
         self._status_lock = threading.RLock()
         self._last_frame = -1
         self._last_out_us = -1
+        self.break_proc: Optional[subprocess.Popen[str]] = None
+        self._break_lock = threading.Lock()
 
     def update(self, **changes: Any) -> None:
         with self._status_lock:
@@ -811,6 +1048,72 @@ class RelayWorker(threading.Thread):
         while not self.stop_event.is_set() and time.monotonic() < end:
             self.stop_event.wait(timeout=0.5)
 
+    # -------------------- البث البديل (شاشة «سنعود قريباً») --------------------
+    def _break_alive(self) -> bool:
+        return self.break_proc is not None and self.break_proc.poll() is None
+
+    def _ensure_break(self) -> None:
+        """يضمن أن شاشة الاستراحة تبث للوجهة عندما لا يوجد بث حي (انقطاع/انتظار/حظر)."""
+        if not self.config.break_enabled:
+            return
+        if self.stop_event.is_set() or self._break_alive():
+            return
+        try:
+            command = build_break_command(self.config, self.output_url)
+        except Exception as exc:
+            LOGGER.warning("[%s] تعذر بناء شاشة الاستراحة: %s", self.name_value, exc)
+            return
+        try:
+            creation_kwargs: dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "bufsize": 1,
+            }
+            if os.name != "nt":
+                creation_kwargs["start_new_session"] = True
+            env = proxy_env(self.config)
+            if env is not None:
+                creation_kwargs["env"] = env
+            proc = subprocess.Popen(command, **creation_kwargs)
+        except OSError as exc:
+            LOGGER.warning("[%s] تعذر تشغيل شاشة الاستراحة: %s", self.name_value, exc)
+            return
+        with self._break_lock:
+            self.break_proc = proc
+        self.update(fallback_running=True)
+        LOGGER.warning("[%s] ▶ البث البديل يعمل الآن (شاشة الاستراحة) حتى يعود المصدر الحي.", self.name_value)
+        threading.Thread(target=self._drain_break_output, args=(proc,), daemon=True).start()
+
+    def _stop_break(self) -> None:
+        with self._break_lock:
+            proc = self.break_proc
+            self.break_proc = None
+        if proc is not None:
+            terminate_process(proc)
+        self.update(fallback_running=False)
+        LOGGER.info("[%s] توقف البث البديل.", self.name_value)
+
+    def _drain_break_output(self, proc: subprocess.Popen[str]) -> None:
+        if proc.stdout is None:
+            return
+        try:
+            for line in proc.stdout:
+                text = line.strip()
+                if text:
+                    LOGGER.info("[%s][بديل] %s", self.name_value, text)
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            # إن مات البديل وحده (مثلاً طرده يوتيوب عند وصول البث الحقيقي) ولم نتوقف عمداً
+            with self._break_lock:
+                if self.break_proc is proc:
+                    self.break_proc = None
+            self.update(fallback_running=False)
+
     def run(self) -> None:
         retry_delay = self.config.reconnect_delay
         while not self.stop_event.is_set():
@@ -820,6 +1123,7 @@ class RelayWorker(threading.Thread):
                 if not source:
                     self.update(state="waiting", message=f"لا يوجد بث مباشر. المحاولة التالية خلال {retry_delay} ثانية")
                     LOGGER.warning("[%s] لم أجد بثاً مباشراً صالحاً. إعادة المحاولة بعد %d ثوانٍ.", self.name_value, retry_delay)
+                    self._ensure_break()
                     self.wait_before_retry(retry_delay)
                     retry_delay = min(self.config.max_reconnect_delay, max(self.config.reconnect_delay, retry_delay * 2))
                     continue
@@ -862,6 +1166,9 @@ class RelayWorker(threading.Thread):
                     except subprocess.TimeoutExpired:
                         now = time.time()
                         snap = self.snapshot()
+                        if snap["first_frame_at"] and now - started > 8 and self._break_alive():
+                            # البث الحي مستقر — يوتيوب انتقل إليه تلقائياً؛ نوقف شاشة الاستراحة
+                            self._stop_break()
                         last_output = snap["last_output_at"]
                         last_advance = snap["last_advance_at"]
                         first_frame_at = snap["first_frame_at"]
@@ -894,6 +1201,7 @@ class RelayWorker(threading.Thread):
                             code = None
                         break
                 if self.stop_event.is_set():
+                    self._stop_break()
                     terminate_process(proc)
                     self.update(state="stopped", message="تم الإيقاف", pid=None, last_exit_code=code)
                     break
@@ -943,6 +1251,9 @@ class RelayWorker(threading.Thread):
                 if failures == 3:
                     self.manager.notify("failing", f"🔴 {self.name_value} فشل 3 مرات متتالية — آخر رسالة: {self.snapshot()['message']}")
                 LOGGER.warning("[%s] ffmpeg توقف برمز %s بعد %.0f ثانية. سيتم التحديث.", self.name_value, code, ran_for)
+                if not refreshing:
+                    # أثناء انتظار إعادة الاتصال: شاشة الاستراحة تحفظ البث من القطع
+                    self._ensure_break()
                 self.wait_before_retry(retry_delay)
             except StopRequested:
                 break
@@ -952,6 +1263,7 @@ class RelayWorker(threading.Thread):
                 self.update(state="error", message=f"{exc}; إعادة المحاولة بعد {retry_delay} ثانية", pid=None, consecutive_failures=failures)
                 LOGGER.exception("[%s] خطأ أثناء إعادة الإرسال", self.name_value)
                 self.wait_before_retry(retry_delay)
+        self._stop_break()
         self.update(state="stopped", message="متوقف", pid=None)
 
     def read_output(self, proc: subprocess.Popen[str]) -> None:
@@ -1092,6 +1404,22 @@ class RelayManager:
         time.sleep(0.3)
         return self.start()
 
+    def break_all(self, action: str) -> tuple[bool, str]:
+        """تشغيل/إيقاف شاشة الاستراحة يدوياً لكل الوجهات العاملة."""
+        with self.lock:
+            workers = [w for w in self.workers if w.is_alive()]
+        if action == "start":
+            if not workers:
+                return False, "لا توجد وجهات عاملة"
+            for worker in workers:
+                worker._ensure_break()
+            return True, "تم تشغيل شاشة الاستراحة على الوجهات العاملة"
+        if action == "stop":
+            for worker in workers:
+                worker._stop_break()
+            return True, "تم إيقاف شاشة الاستراحة"
+        return False, "إجراء غير معروف" 
+
     def is_running(self) -> bool:
         with self.lock:
             return any(worker.is_alive() for worker in self.workers)
@@ -1158,8 +1486,8 @@ HTML = r'''<!doctype html>
 <section class="grid">
 <div class="card"><div class="card-head"><h2>الحالة الآن</h2><span id="refreshLabel" class="label">تحديث تلقائي</span></div><div class="stats"><div class="stat"><span class="label">الحالة</span><b id="mainState">متوقف</b></div><div class="stat"><span class="label">الوجهات</span><b id="workerCount">0</b></div><div class="stat"><span class="label">مدة التشغيل</span><b id="uptime">00:00:00</b></div></div><div class="actions"><button id="startBtn" class="btn primary">تشغيل البث</button><button id="restartBtn" class="btn">إعادة تشغيل</button><button id="stopBtn" class="btn danger">إيقاف</button></div></div>
 <div class="card"><div class="card-head"><h2>الوجهات</h2><span class="label">تحكم فردي بكل وجهة — المفاتيح مخفية</span></div><div id="workers" class="worker-list"><div class="worker-msg">لا توجد وجهات قيد التشغيل.</div></div></div>
-<div class="card"><div class="card-head"><h2>أدوات التحكم</h2><span class="label">كل شيء من هنا</span></div><div class="actions"><button id="refreshSourceBtn" class="btn">تحديث المصدر الآن</button><button id="testWebhookBtn" class="btn">اختبار Webhook</button><button id="downloadLogBtn" class="btn">تنزيل السجل الكامل</button><button id="restartAppBtn" class="btn danger">إعادة تشغيل التطبيق</button></div><div class="row" style="margin-top:16px"><div class="field"><label for="log_level">مستوى السجل</label><select id="log_level"><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select><small>يُطبق فوراً ويُحفظ مع الإعدادات.</small></div><div class="field"><label for="new_token">تغيير رمز اللوحة</label><input id="current_token" type="password" placeholder="الرمز الحالي (إن وُجد)" autocomplete="off"><input id="new_token" type="password" placeholder="رمز جديد — 6 أحرف فأكثر" autocomplete="new-password"><small>يُحفظ في config.json ويُطلب عند الدخول التالي.</small></div></div><div class="actions"><button id="applyLogLevelBtn" class="btn">تطبيق مستوى السجل</button><button id="changeTokenBtn" class="btn primary">تغيير الرمز</button></div></div>
-<div class="card full"><div class="card-head"><h2>الإعدادات</h2><span class="label">يمكن الحفظ أثناء التشغيل — يُعاد تشغيل البث تلقائياً لتطبيق التغييرات</span></div><form id="configForm"><div class="row"><div class="field"><label for="source_url">رابط المصدر الرئيسي</label><input id="source_url" name="source_url" type="url" required><small>رابط بث YouTube أو صفحة /live للقناة.</small></div><div class="field"><label for="rtmp_base">عنوان RTMP الأساسي</label><input id="rtmp_base" name="rtmp_base" type="url" required><small>مثال: rtmp://a.rtmp.youtube.com/live2</small></div></div><div class="field"><label for="backup_sources">مصادر احتياطية اختيارية</label><textarea id="backup_sources" name="backup_sources" placeholder="ضع رابطاً في كل سطر"></textarea><small>إذا تعذر المصدر الرئيسي، يجرب التطبيق هذه الروابط بالترتيب تلقائياً.</small></div><div class="field"><label for="stream_keys">مفاتيح البث</label><textarea id="stream_keys" name="stream_keys" placeholder="ضع مفتاحاً في كل سطر أو افصل بينها بفواصل"></textarea><small id="keysHint">إذا كان هناك مفتاح محفوظ، اترك الحقل فارغاً للإبقاء عليه. لا يظهر المفتاح بعد الحفظ.</small></div><div class="row"><div class="field"><label for="resolution">الدقة</label><select id="resolution" name="resolution"><option>1920x1080</option><option>1280x720</option><option>854x480</option><option>640x360</option></select></div><div class="field"><label for="fps">الإطارات في الثانية</label><input id="fps" name="fps" type="number" min="1" max="120"></div></div><div class="row"><div class="field"><label for="video_bitrate">معدل الفيديو</label><input id="video_bitrate" name="video_bitrate" placeholder="3000k"></div><div class="field"><label for="audio_bitrate">معدل الصوت</label><input id="audio_bitrate" name="audio_bitrate" placeholder="160k"></div></div><div class="row"><div class="field"><label for="reconnect_delay">أول تأخير بين المحاولات (ثانية)</label><input id="reconnect_delay" name="reconnect_delay" type="number" min="3" max="300"></div><div class="field"><label for="max_reconnect_delay">أقصى تأخير تلقائي (ثانية)</label><input id="max_reconnect_delay" name="max_reconnect_delay" type="number" min="3" max="900"></div></div><div class="row"><div class="field"><label for="health_timeout">مهلة صحة البث (ثانية)</label><input id="health_timeout" name="health_timeout" type="number" min="15" max="600"><small>إذا صمت ffmpeg تماماً أكثر من هذه المدة يُعاد تشغيل البث.</small></div><div class="field"><label for="stall_timeout">مهلة انقطاع البيانات (ثانية)</label><input id="stall_timeout" name="stall_timeout" type="number" min="10" max="300"><small>إذا توقف تقدّم البيانات — أو لم يظهر أول إطار عند الإقلاع — أكثر من هذه المهلة يُعاد الاتصال برابط جديد فوراً قبل أن تظهر رسالة «لا تتوفّر بيانات» في يوتيوب. الموصى: 15.</small></div></div><div class="row"><div class="field"><label for="preset">سرعة ترميز x264</label><select id="preset" name="preset"><option>ultrafast</option><option>superfast</option><option>veryfast</option><option>faster</option><option>fast</option><option>medium</option><option>slow</option></select><small>على خادم ضعيف اختر faster أو fast حتى لا يتأخر الترميز عن الزمن الحقيقي (سبب رسالة «البيانات غير كافية»).</small></div><div class="field"><label for="max_session_minutes">تجديد رابط المصدر كل (دقيقة)</label><input id="max_session_minutes" name="max_session_minutes" type="number" min="0" max="720"><small>روابط بث يوتيوب تنتهي صلاحيتها أثناء العمل؛ يُجدد الرابط تلقائياً قبل موته. 0 = تعطيل. الموصى: 120.</small></div></div><div class="row"><div class="field"><label for="cookies_from_browser">مصدر Cookies اختياري</label><input id="cookies_from_browser" name="cookies_from_browser" placeholder="chrome أو chrome:Default"><small>اتركه فارغاً إلا إذا كان المصدر يحتاج تسجيل دخول.</small></div><div class="field"><label for="cookiefile">ملف Cookies اختياري</label><input id="cookiefile" name="cookiefile" placeholder="/path/to/cookies.txt"></div></div><div class="row"><div class="field"><label for="proxy">بروكسي اختياري (http/https)</label><input id="proxy" name="proxy" placeholder="http://user:pass@host:3128"><small>استخدمه إذا كانت يوتيوب تحجب مقاطع الفيديو عن IP الخادم (أخطاء 403 في السجل). اتركه فارغاً للإبقاء على القيمة الحالية.</small></div><div class="field"><label class="check" style="margin-top:26px"><input id="clear_proxy" type="checkbox"> حذف البروكسي الحالي عند الحفظ</label><small>فعّله فقط إذا أردت إزالة بروكسي محفوظ نهائياً.</small></div></div><div class="field"><label for="notify_webhook">رابط إشعارات Webhook اختياري</label><input id="notify_webhook" name="notify_webhook" type="url" placeholder="https://discord.com/api/webhooks/..."><small>يصلك إشعار عند بدء البث، تحويل المصدر الاحتياطي، توقف التدفق، أو تكرار الفشل. يدعم Discord وSlack وntfy وأي نقطة تقبل JSON.</small></div><label class="check"><input id="auto_start" name="auto_start" type="checkbox"> تشغيل تلقائي عند تشغيل التطبيق</label><div class="actions"><button class="btn primary" type="submit">حفظ الإعدادات</button><button class="btn" type="button" id="testSourceBtn">اختبار المصدر</button><button class="btn ghost" type="button" id="clearKeysBtn">حذف المفاتيح المحفوظة</button></div></form></div>
+<div class="card"><div class="card-head"><h2>أدوات التحكم</h2><span class="label">كل شيء من هنا</span></div><div class="actions"><button id="refreshSourceBtn" class="btn">تحديث المصدر الآن</button><button id="breakStartBtn" class="btn">تشغيل شاشة الاستراحة</button><button id="breakStopBtn" class="btn">إيقاف شاشة الاستراحة</button><button id="testWebhookBtn" class="btn">اختبار Webhook</button><button id="downloadLogBtn" class="btn">تنزيل السجل الكامل</button><button id="restartAppBtn" class="btn danger">إعادة تشغيل التطبيق</button></div><div class="row" style="margin-top:16px"><div class="field"><label for="log_level">مستوى السجل</label><select id="log_level"><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select><small>يُطبق فوراً ويُحفظ مع الإعدادات.</small></div><div class="field"><label for="new_token">تغيير رمز اللوحة</label><input id="current_token" type="password" placeholder="الرمز الحالي (إن وُجد)" autocomplete="off"><input id="new_token" type="password" placeholder="رمز جديد — 6 أحرف فأكثر" autocomplete="new-password"><small>يُحفظ في config.json ويُطلب عند الدخول التالي.</small></div></div><div class="actions"><button id="applyLogLevelBtn" class="btn">تطبيق مستوى السجل</button><button id="changeTokenBtn" class="btn primary">تغيير الرمز</button></div></div>
+<div class="card full"><div class="card-head"><h2>الإعدادات</h2><span class="label">يمكن الحفظ أثناء التشغيل — يُعاد تشغيل البث تلقائياً لتطبيق التغييرات</span></div><form id="configForm"><div class="row"><div class="field"><label for="source_url">رابط المصدر الرئيسي</label><input id="source_url" name="source_url" type="url" required><small>رابط بث YouTube أو صفحة /live للقناة.</small></div><div class="field"><label for="rtmp_base">عنوان RTMP الأساسي</label><input id="rtmp_base" name="rtmp_base" type="url" required><small>مثال: rtmp://a.rtmp.youtube.com/live2</small></div></div><div class="field"><label for="backup_sources">مصادر احتياطية اختيارية</label><textarea id="backup_sources" name="backup_sources" placeholder="ضع رابطاً في كل سطر"></textarea><small>إذا تعذر المصدر الرئيسي، يجرب التطبيق هذه الروابط بالترتيب تلقائياً.</small></div><div class="field"><label for="stream_keys">مفاتيح البث</label><textarea id="stream_keys" name="stream_keys" placeholder="ضع مفتاحاً في كل سطر أو افصل بينها بفواصل"></textarea><small id="keysHint">إذا كان هناك مفتاح محفوظ، اترك الحقل فارغاً للإبقاء عليه. لا يظهر المفتاح بعد الحفظ.</small></div><div class="row"><div class="field"><label for="resolution">الدقة</label><select id="resolution" name="resolution"><option>1920x1080</option><option>1280x720</option><option>854x480</option><option>640x360</option></select></div><div class="field"><label for="fps">الإطارات في الثانية</label><input id="fps" name="fps" type="number" min="1" max="120"></div></div><div class="row"><div class="field"><label for="video_bitrate">معدل الفيديو</label><input id="video_bitrate" name="video_bitrate" placeholder="3000k"></div><div class="field"><label for="audio_bitrate">معدل الصوت</label><input id="audio_bitrate" name="audio_bitrate" placeholder="160k"></div></div><div class="row"><div class="field"><label for="reconnect_delay">أول تأخير بين المحاولات (ثانية)</label><input id="reconnect_delay" name="reconnect_delay" type="number" min="3" max="300"></div><div class="field"><label for="max_reconnect_delay">أقصى تأخير تلقائي (ثانية)</label><input id="max_reconnect_delay" name="max_reconnect_delay" type="number" min="3" max="900"></div></div><div class="row"><div class="field"><label for="health_timeout">مهلة صحة البث (ثانية)</label><input id="health_timeout" name="health_timeout" type="number" min="15" max="600"><small>إذا صمت ffmpeg تماماً أكثر من هذه المدة يُعاد تشغيل البث.</small></div><div class="field"><label for="stall_timeout">مهلة انقطاع البيانات (ثانية)</label><input id="stall_timeout" name="stall_timeout" type="number" min="10" max="300"><small>إذا توقف تقدّم البيانات — أو لم يظهر أول إطار عند الإقلاع — أكثر من هذه المهلة يُعاد الاتصال برابط جديد فوراً قبل أن تظهر رسالة «لا تتوفّر بيانات» في يوتيوب. الموصى: 15.</small></div></div><div class="row"><div class="field"><label for="preset">سرعة ترميز x264</label><select id="preset" name="preset"><option>ultrafast</option><option>superfast</option><option>veryfast</option><option>faster</option><option>fast</option><option>medium</option><option>slow</option></select><small>على خادم ضعيف اختر faster أو fast حتى لا يتأخر الترميز عن الزمن الحقيقي (سبب رسالة «البيانات غير كافية»).</small></div><div class="field"><label for="max_session_minutes">تجديد رابط المصدر كل (دقيقة)</label><input id="max_session_minutes" name="max_session_minutes" type="number" min="0" max="720"><small>روابط بث يوتيوب تنتهي صلاحيتها أثناء العمل؛ يُجدد الرابط تلقائياً قبل موته. 0 = تعطيل. الموصى: 120.</small></div></div><div class="row"><div class="field"><label for="cookies_from_browser">مصدر Cookies اختياري</label><input id="cookies_from_browser" name="cookies_from_browser" placeholder="chrome أو chrome:Default"><small>اتركه فارغاً إلا إذا كان المصدر يحتاج تسجيل دخول.</small></div><div class="field"><label for="cookiefile">ملف Cookies اختياري</label><input id="cookiefile" name="cookiefile" placeholder="/path/to/cookies.txt"></div></div><div class="row"><div class="field"><label for="proxy">بروكسي اختياري (http/https)</label><input id="proxy" name="proxy" placeholder="http://user:pass@host:3128"><small>استخدمه إذا كانت يوتيوب تحجب مقاطع الفيديو عن IP الخادم (أخطاء 403 في السجل). اتركه فارغاً للإبقاء على القيمة الحالية.</small></div><div class="field"><label class="check" style="margin-top:26px"><input id="clear_proxy" type="checkbox"> حذف البروكسي الحالي عند الحفظ</label><small>فعّله فقط إذا أردت إزالة بروكسي محفوظ نهائياً.</small></div></div><div class="row"><div class="field"><label for="logo_path">شعار البث (صورة PNG بخلفية شفافة)</label><input id="logo_path" name="logo_path" placeholder="/opt/yoteblive/media/logo.png"><small>مسار صورة على الخادم. تُعرض فوق البث في زاوية الشاشة. اتركها فارغة لإيقاف الشعار.</small></div><div class="field"><label for="logo_mode">وضع الشعار</label><select id="logo_mode" name="logo_mode"><option value="off">متوقف</option><option value="always">دائم</option><option value="periodic">دوري (يظهر ثم يختفي)</option></select><small>الدوري يظهر الشعار logo_show ثانية كل (logo_show + logo_hide) ثانية.</small></div></div><div class="row"><div class="field"><label for="logo_position">موضع الشعار</label><select id="logo_position" name="logo_position"><option value="tl">أعلى يسار</option><option value="tr">أعلى يمين</option><option value="bl">أسفل يسار</option><option value="br">أسفل يمين</option><option value="center">الوسط</option></select></div><div class="field"><label for="logo_width">عرض الشعار بالبكسل (0 = تلقائي)</label><input id="logo_width" name="logo_width" type="number" min="0" max="2000"><small>يُصغَّر تلقائياً إن كانت الصورة أكبر.</small></div></div><div class="row"><div class="field"><label for="logo_show">مدة الظهور (ثانية)</label><input id="logo_show" name="logo_show" type="number" min="1" max="3600"></div><div class="field"><label for="logo_hide">مدة الاختفاء (ثانية)</label><input id="logo_hide" name="logo_hide" type="number" min="1" max="3600"></div></div><div class="field"><label for="pip_slots">منافذ العرض (PiP) — صورة/فيديو تُعرض فوق البث</label><textarea id="pip_slots" name="pip_slots" placeholder='{"name":"صورة الموضوع","path":"/opt/yoteblive/media/subject.png","position":"br","width":480,"mode":"periodic","show":20,"hide":30}'></textarea><small>سطر JSON واحد لكل منفذ (حتى 3). الوضع: off/always/periodic. مثال: صورة تعرضها عند حديث المتحدث عنها. الفيديو بصيغ mp4/mkv/webm. تُطبق التغييرات عند الحفظ (إعادة تشغيل البث).</small></div><div class="field"><label for="break_text">شاشة الاستراحة — النص (يظهر عند انقطاع المصدر)</label><input id="break_text" name="break_text" placeholder="سنعود قريباً"></div><div class="row"><div class="field"><label for="break_image">صورة خلفية الاستراحة (اختياري)</label><input id="break_image" name="break_image" placeholder="/opt/yoteblive/media/break.png"><small>فارغة = خلفية داكنة بنص عربي.</small></div><div class="field"><label for="break_audio">ملف صوت خلفية (اختياري)</label><input id="break_audio" name="break_audio" placeholder="/opt/yoteblive/media/break.mp3"><small>فارغ = صمت. mp3/m4a/aac.</small></div></div><label class="check"><input id="break_enabled" name="break_enabled" type="checkbox"> تفعيل البث البديل تلقائياً عند انقطاع المصدر (يمنع رسالة «سينتهي البث» في يوتيوب)</label><div class="field"><label for="notify_webhook">رابط إشعارات Webhook اختياري</label><input id="notify_webhook" name="notify_webhook" type="url" placeholder="https://discord.com/api/webhooks/..."><small>يصلك إشعار عند بدء البث، تحويل المصدر الاحتياطي، توقف التدفق، أو تكرار الفشل. يدعم Discord وSlack وntfy وأي نقطة تقبل JSON.</small></div><label class="check"><input id="auto_start" name="auto_start" type="checkbox"> تشغيل تلقائي عند تشغيل التطبيق</label><div class="actions"><button class="btn primary" type="submit">حفظ الإعدادات</button><button class="btn" type="button" id="testSourceBtn">اختبار المصدر</button><button class="btn ghost" type="button" id="clearKeysBtn">حذف المفاتيح المحفوظة</button></div></form></div>
 <div class="card full"><div class="card-head"><h2>سجل التشغيل</h2><button class="btn ghost" id="clearLogBtn">مسح العرض</button></div><div id="logs" class="logbox">جاري تحميل السجل…</div></div>
 </section><div class="footer">الواجهة تعمل على المنفذ __PORT__ — تحديث الحالة كل 3 ثوانٍ</div>
 </main>
@@ -1172,13 +1500,13 @@ function duration(sec){sec=Math.max(0,Number(sec||0));let h=String(Math.floor(se
 function notice(msg,type='ok'){let n=$('notice');n.textContent=msg;n.className=`notice show ${type}`;clearTimeout(window.noticeTimer);window.noticeTimer=setTimeout(()=>n.className='notice',5500)}
 async function api(url,options={},retry=true){let headers={'Content-Type':'application/json',...(options.headers||{})};if(panelToken)headers['X-Panel-Token']=panelToken;let r=await fetch(url,{...options,headers});let d=await r.json().catch(()=>({message:'رد غير صالح'}));if(r.status===401&&retry){let t=prompt('أدخل رمز الدخول للوحة التحكم:');if(t!==null){panelToken=t.trim();localStorage.setItem('panelToken',panelToken);return api(url,options,false)}}if(!r.ok)throw new Error(d.message||d.error||'حدث خطأ');return d}
 function stateLabel(s){return ({running:'يعمل',resolving:'يبحث عن المصدر',waiting:'ينتظر البث',reconnecting:'يعيد الاتصال',error:'خطأ',stopped:'متوقف'})[s]||s||'متوقف'}
-function renderStatus(d){let active=d.running,states=(d.workers||[]).map(w=>w.state),hasError=states.includes('error'),waiting=states.some(s=>['waiting','resolving','reconnecting'].includes(s));$('statusText').textContent=active?(hasError?'يعمل مع خطأ مؤقت':waiting?'ينتظر المصدر':'البث يعمل'):'متوقف';$('statusDot').className=`dot ${active?(hasError?'bad':waiting?'warn':'live'):''}`;$('mainState').textContent=active?(hasError?'خطأ مؤقت':waiting?'إعادة اتصال':'يعمل'):'متوقف';$('workerCount').textContent=d.worker_count||0;$('uptime').textContent=duration(d.uptime_seconds);$('startBtn').disabled=active;$('stopBtn').disabled=!active;$('restartBtn').disabled=!active&&!(lastConfig&&lastConfig.has_stream_keys);let box=$('workers');if(!d.workers?.length){box.innerHTML='<div class="worker-msg">لا توجد وجهات قيد التشغيل.</div>';return}box.innerHTML=d.workers.map(w=>{let stats='',chart='',alive=w.state!=='stopped';if(w.state==='running'&&(w.stats_fps||w.stats_bitrate||w.stats_speed)){stats=`<br>⚡ ${esc(w.stats_fps||'—')} fps — ${esc(w.stats_bitrate||'—')} — سرعة ${esc(w.stats_speed||'—')}${w.stats_frame?` — ${w.stats_frame} إطار`:''}${w.stats_out_time?` — ${esc(w.stats_out_time)}`:''}`;let kb=parseKbps(w.stats_bitrate);if(kb!==null){(chartData[w.name]=chartData[w.name]||[]).push(kb);if(chartData[w.name].length>CHART_MAX)chartData[w.name].shift();chart=`<canvas class="chart" id="chart-${esc(w.name)}" width="280" height="44"></canvas>`}}let btn=alive?`<button class="btn danger wbtn" data-act="stop" data-name="${esc(w.name)}">إيقاف</button>`:`<button class="btn primary wbtn" data-act="start" data-name="${esc(w.name)}">تشغيل</button>`;return `<div class="worker"><div class="worker-top"><span class="worker-name">${esc(w.name)}</span><span style="display:flex;gap:8px;align-items:center"><span class="badge ${esc(w.state)}">${esc(stateLabel(w.state))}</span>${btn}</span></div><div class="worker-msg">${esc(w.message)}${w.last_source?`<br>المصدر: ${esc(w.last_source)}`:''}${stats}${w.attempts?`<br>المحاولات: ${w.attempts} — مدة التشغيل: ${duration(w.uptime_seconds)}`:''}</div>${chart}</div>`}).join('');d.workers.forEach(w=>drawChart(w.name));box.querySelectorAll('.wbtn').forEach(b=>b.onclick=async()=>{b.disabled=true;try{let r=await api('/api/worker/'+b.dataset.act,{method:'POST',body:JSON.stringify({name:b.dataset.name})});notice(r.message)}catch(e){notice(e.message,'error')}finally{refresh()}})}
-function renderConfig(c){lastConfig=c;$('source_url').value=c.source_url||'';$('backup_sources').value=(c.backup_sources||[]).join('\n');$('rtmp_base').value=c.rtmp_base||'';$('resolution').value=c.resolution||'1280x720';$('fps').value=c.fps||30;$('video_bitrate').value=c.video_bitrate||'3000k';$('audio_bitrate').value=c.audio_bitrate||'160k';$('preset').value=c.preset||'veryfast';$('reconnect_delay').value=c.reconnect_delay||10;$('max_reconnect_delay').value=c.max_reconnect_delay||60;$('health_timeout').value=c.health_timeout||45;$('cookies_from_browser').value=c.cookies_from_browser||'';$('cookiefile').value=c.cookiefile||'';$('proxy').value=c.proxy||'';$('proxy').placeholder=c.has_proxy?'بروكسي محفوظ — اتركه فارغاً للإبقاء عليه':'http://user:pass@host:3128';$('clear_proxy').checked=false;$('notify_webhook').value=c.notify_webhook||'';$('log_level').value=c.log_level||'INFO';$('auto_start').checked=!!c.auto_start;$('keysHint').textContent=c.has_stream_keys?`يوجد ${c.stream_key_count} مفتاح محفوظ. اترك الحقل فارغاً للإبقاء عليه.`:'لا يوجد مفتاح محفوظ حالياً.'}
+function renderStatus(d){let active=d.running,states=(d.workers||[]).map(w=>w.state),hasError=states.includes('error'),waiting=states.some(s=>['waiting','resolving','reconnecting'].includes(s));$('statusText').textContent=active?(hasError?'يعمل مع خطأ مؤقت':waiting?'ينتظر المصدر':'البث يعمل'):'متوقف';$('statusDot').className=`dot ${active?(hasError?'bad':waiting?'warn':'live'):''}`;$('mainState').textContent=active?(hasError?'خطأ مؤقت':waiting?'إعادة اتصال':'يعمل'):'متوقف';$('workerCount').textContent=d.worker_count||0;$('uptime').textContent=duration(d.uptime_seconds);$('startBtn').disabled=active;$('stopBtn').disabled=!active;$('restartBtn').disabled=!active&&!(lastConfig&&lastConfig.has_stream_keys);let box=$('workers');if(!d.workers?.length){box.innerHTML='<div class="worker-msg">لا توجد وجهات قيد التشغيل.</div>';return}box.innerHTML=d.workers.map(w=>{let stats='',chart='',alive=w.state!=='stopped';if(w.state==='running'&&(w.stats_fps||w.stats_bitrate||w.stats_speed)){stats=`<br>⚡ ${esc(w.stats_fps||'—')} fps — ${esc(w.stats_bitrate||'—')} — سرعة ${esc(w.stats_speed||'—')}${w.stats_frame?` — ${w.stats_frame} إطار`:''}${w.stats_out_time?` — ${esc(w.stats_out_time)}`:''}`;let kb=parseKbps(w.stats_bitrate);if(kb!==null){(chartData[w.name]=chartData[w.name]||[]).push(kb);if(chartData[w.name].length>CHART_MAX)chartData[w.name].shift();chart=`<canvas class="chart" id="chart-${esc(w.name)}" width="280" height="44"></canvas>`}}let btn=alive?`<button class="btn danger wbtn" data-act="stop" data-name="${esc(w.name)}">إيقاف</button>`:`<button class="btn primary wbtn" data-act="start" data-name="${esc(w.name)}">تشغيل</button>`;let fb=w.fallback_running?`<span class="badge waiting">▶ استراحة تعمل</span>`:'';return `<div class="worker"><div class="worker-top"><span class="worker-name">${esc(w.name)}</span><span style="display:flex;gap:8px;align-items:center">${fb}<span class="badge ${esc(w.state)}">${esc(stateLabel(w.state))}</span>${btn}</span></div><div class="worker-msg">${esc(w.message)}${w.last_source?`<br>المصدر: ${esc(w.last_source)}`:''}${stats}${w.attempts?`<br>المحاولات: ${w.attempts} — مدة التشغيل: ${duration(w.uptime_seconds)}`:''}</div>${chart}</div>`}).join('');d.workers.forEach(w=>drawChart(w.name));box.querySelectorAll('.wbtn').forEach(b=>b.onclick=async()=>{b.disabled=true;try{let r=await api('/api/worker/'+b.dataset.act,{method:'POST',body:JSON.stringify({name:b.dataset.name})});notice(r.message)}catch(e){notice(e.message,'error')}finally{refresh()}})}
+function renderConfig(c){lastConfig=c;$('source_url').value=c.source_url||'';$('backup_sources').value=(c.backup_sources||[]).join('\n');$('rtmp_base').value=c.rtmp_base||'';$('resolution').value=c.resolution||'1280x720';$('fps').value=c.fps||30;$('video_bitrate').value=c.video_bitrate||'3000k';$('audio_bitrate').value=c.audio_bitrate||'160k';$('preset').value=c.preset||'veryfast';$('reconnect_delay').value=c.reconnect_delay||10;$('max_reconnect_delay').value=c.max_reconnect_delay||60;$('health_timeout').value=c.health_timeout||45;$('cookies_from_browser').value=c.cookies_from_browser||'';$('cookiefile').value=c.cookiefile||'';$('proxy').value=c.proxy||'';$('proxy').placeholder=c.has_proxy?'بروكسي محفوظ — اتركه فارغاً للإبقاء عليه':'http://user:pass@host:3128';$('clear_proxy').checked=false;$('logo_path').value=c.logo_path||'';$('logo_mode').value=c.logo_mode||'off';$('logo_position').value=c.logo_position||'br';$('logo_width').value=c.logo_width||0;$('logo_show').value=c.logo_show||12;$('logo_hide').value=c.logo_hide||40;$('pip_slots').value=(c.pip_slots||[]).map(x=>JSON.stringify(x)).join('\n');$('break_text').value=c.break_text||'سنعود قريباً';$('break_image').value=c.break_image||'';$('break_audio').value=c.break_audio||'';$('break_enabled').checked=!!c.break_enabled;$('notify_webhook').value=c.notify_webhook||'';$('log_level').value=c.log_level||'INFO';$('auto_start').checked=!!c.auto_start;$('keysHint').textContent=c.has_stream_keys?`يوجد ${c.stream_key_count} مفتاح محفوظ. اترك الحقل فارغاً للإبقاء عليه.`:'لا يوجد مفتاح محفوظ حالياً.'}
 async function refresh(){try{let [s,l]=await Promise.all([api('/api/status'),api('/api/logs')]);renderStatus(s);let box=$('logs'),nearBottom=box.scrollHeight-box.scrollTop-box.clientHeight<40;box.textContent=(l.lines||[]).join('\n')||'لا يوجد سجل بعد.';if(nearBottom)box.scrollTop=box.scrollHeight}catch(e){notice(e.message,'error')}}
-$('configForm').addEventListener('submit',async e=>{e.preventDefault();let f=new FormData(e.target),keys=String(f.get('stream_keys')||'').trim();try{let d=await api('/api/config',{method:'POST',body:JSON.stringify({source_url:f.get('source_url'),backup_sources:String(f.get('backup_sources')||'').split(/[\n,]+/).map(x=>x.trim()).filter(Boolean),rtmp_base:f.get('rtmp_base'),stream_keys:keys?keys.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean):[],resolution:f.get('resolution'),fps:Number(f.get('fps')),video_bitrate:f.get('video_bitrate'),audio_bitrate:f.get('audio_bitrate'),preset:f.get('preset')||'veryfast',reconnect_delay:Number(f.get('reconnect_delay')),max_reconnect_delay:Number(f.get('max_reconnect_delay')),health_timeout:Number(f.get('health_timeout')),stall_timeout:Number(f.get('stall_timeout')),max_session_minutes:Number(f.get('max_session_minutes')),cookies_from_browser:f.get('cookies_from_browser'),cookiefile:f.get('cookiefile'),proxy:$('proxy').value.trim(),clear_proxy:$('clear_proxy').checked,notify_webhook:f.get('notify_webhook'),auto_start:$('auto_start').checked,keep_keys:!keys})});renderConfig(d.config);$('stream_keys').value='';notice(d.message||'تم حفظ الإعدادات')}catch(e){notice(e.message,'error')}});
+$('configForm').addEventListener('submit',async e=>{e.preventDefault();let f=new FormData(e.target),keys=String(f.get('stream_keys')||'').trim();try{let d=await api('/api/config',{method:'POST',body:JSON.stringify({source_url:f.get('source_url'),backup_sources:String(f.get('backup_sources')||'').split(/[\n,]+/).map(x=>x.trim()).filter(Boolean),rtmp_base:f.get('rtmp_base'),stream_keys:keys?keys.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean):[],resolution:f.get('resolution'),fps:Number(f.get('fps')),video_bitrate:f.get('video_bitrate'),audio_bitrate:f.get('audio_bitrate'),preset:f.get('preset')||'veryfast',reconnect_delay:Number(f.get('reconnect_delay')),max_reconnect_delay:Number(f.get('max_reconnect_delay')),health_timeout:Number(f.get('health_timeout')),stall_timeout:Number(f.get('stall_timeout')),max_session_minutes:Number(f.get('max_session_minutes')),cookies_from_browser:f.get('cookies_from_browser'),cookiefile:f.get('cookiefile'),proxy:$('proxy').value.trim(),clear_proxy:$('clear_proxy').checked,logo_path:$('logo_path').value.trim(),logo_position:$('logo_position').value,logo_width:Number($('logo_width').value),logo_mode:$('logo_mode').value,logo_show:Number($('logo_show').value),logo_hide:Number($('logo_hide').value),pip_slots:$('pip_slots').value.split(/\n+/).map(x=>x.trim()).filter(Boolean).map(x=>JSON.parse(x)),break_enabled:$('break_enabled').checked,break_image:$('break_image').value.trim(),break_text:$('break_text').value.trim(),break_audio:$('break_audio').value.trim(),notify_webhook:f.get('notify_webhook'),auto_start:$('auto_start').checked,keep_keys:!keys})});renderConfig(d.config);$('stream_keys').value='';notice(d.message||'تم حفظ الإعدادات')}catch(e){notice(e.message,'error')}});
 $('testSourceBtn').onclick=async()=>{let b=$('testSourceBtn');b.disabled=true;b.textContent='جارٍ الاختبار…';try{let d=await api('/api/test-source',{method:'POST',body:'{}'});notice(`المصدر صالح: ${d.title||'بدون عنوان'} — ${d.mode}`)}catch(e){notice(e.message,'error')}finally{b.disabled=false;b.textContent='اختبار المصدر'}};
 $('startBtn').onclick=async()=>{try{let d=await api('/api/start',{method:'POST',body:'{}'});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('stopBtn').onclick=async()=>{try{let d=await api('/api/stop',{method:'POST',body:'{}'});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('restartBtn').onclick=async()=>{try{let d=await api('/api/restart',{method:'POST',body:'{}'});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('clearKeysBtn').onclick=async()=>{if(!confirm('حذف جميع مفاتيح البث المحفوظة؟'))return;try{let d=await api('/api/config',{method:'POST',body:JSON.stringify({clear_keys:true})});renderConfig(d.config);notice('تم حذف المفاتيح')}catch(e){notice(e.message,'error')}};$('clearLogBtn').onclick=()=>{$('logs').textContent=''};
-$('refreshSourceBtn').onclick=async()=>{try{let d=await api('/api/source/refresh',{method:'POST',body:'{}'});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};
+$('refreshSourceBtn').onclick=async()=>{try{let d=await api('/api/source/refresh',{method:'POST',body:'{}'});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('breakStartBtn').onclick=async()=>{try{let d=await api('/api/break',{method:'POST',body:JSON.stringify({action:'start'})});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('breakStopBtn').onclick=async()=>{try{let d=await api('/api/break',{method:'POST',body:JSON.stringify({action:'stop'})});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};
 $('testWebhookBtn').onclick=async()=>{try{let d=await api('/api/webhook/test',{method:'POST',body:'{}'});notice(d.message)}catch(e){notice(e.message,'error')}};
 $('applyLogLevelBtn').onclick=async()=>{try{let d=await api('/api/log-level',{method:'POST',body:JSON.stringify({level:$('log_level').value})});notice(d.message)}catch(e){notice(e.message,'error')}};
 $('changeTokenBtn').onclick=async()=>{let nt=$('new_token').value.trim();if(nt.length<6){notice('الرمز الجديد يجب أن يكون 6 أحرف على الأقل','error');return}try{let d=await api('/api/token',{method:'POST',body:JSON.stringify({current:$('current_token').value,new:nt})});panelToken=nt;localStorage.setItem('panelToken',nt);$('current_token').value='';$('new_token').value='';notice(d.message)}catch(e){notice(e.message,'error')}};
@@ -1369,6 +1697,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/worker/stop":
                 ok, message = MANAGER.stop_one(str(data.get("name", "")))
+                self.send_json({"ok": ok, "message": message}, 200 if ok else 400)
+                return
+            if path == "/api/break":
+                ok, message = MANAGER.break_all(str(data.get("action", "")))
                 self.send_json({"ok": ok, "message": message}, 200 if ok else 400)
                 return
             if path == "/api/source/refresh":
