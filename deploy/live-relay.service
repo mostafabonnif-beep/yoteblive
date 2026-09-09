@@ -1,22 +1,25 @@
-# انسخ الملف إلى /etc/systemd/system/live-relay.service ثم:
-#   sudo systemctl daemon-reload && sudo systemctl enable --now live-relay
+# انسخه إلى /etc/systemd/system/yoteblive.service بعد تعديل المسار حسب مكان استنساخك:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now yoteblive
 [Unit]
-Description=YouTube Live Relay
+Description=YouTube Live Relay (yoteblive)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=relay
-WorkingDirectory=/opt/youtube-live-relay
+WorkingDirectory=/opt/yoteblive
 Environment=HOST=127.0.0.1 PORT=7861 LOG_LEVEL=INFO
 # Environment=PANEL_TOKEN=ضع-رمزاً-قوياً-هنا
-ExecStart=/usr/bin/python3 /opt/youtube-live-relay/app.py
+# Environment=FFMPEG=/opt/ffmpeg/ffmpeg
+ExecStart=/usr/bin/python3 /opt/yoteblive/app.py
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=full
-ReadWritePaths=/opt/youtube-live-relay/data
+ReadWritePaths=/opt/yoteblive/data
+# إن استخدمت مجلد وسائط للرسوم:
+# ReadWritePaths=/opt/yoteblive/data /opt/yoteblive/media
 
 [Install]
 WantedBy=multi-user.target

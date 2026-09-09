@@ -12,3 +12,4 @@ services:
       LOG_LEVEL: INFO
     volumes:
       - ./data:/app/data
+      - ./media:/app/media   # ضع logo.png / subject.png / break.png هنا على جهازك

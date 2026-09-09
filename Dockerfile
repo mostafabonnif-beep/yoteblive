@@ -7,7 +7,8 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py README.md ./
+COPY app.py yt_api.py README.md ./
+COPY media ./media
 COPY data/config.example.json data/config.example.json
 
 ENV HOST=0.0.0.0 PORT=7861
