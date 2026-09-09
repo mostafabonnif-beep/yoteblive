@@ -23,6 +23,10 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
+try:
+    import yt_api as yt
+except Exception:  # yt_api.py بجانب app.py عادةً
+    yt = None  # type: ignore
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -56,6 +60,8 @@ DEFAULTS = {
     "logo_show": 12,
     "logo_hide": 40,
     "pip_slots": [],
+    "yt_secrets_path": "data/client_secrets.json",
+    "yt_token_path": "data/yt_token.json",
     "break_enabled": True,
     "break_image": "",
     "break_text": "سنعود قريباً",
@@ -114,6 +120,8 @@ class RelayConfig:
     logo_show: int = 12
     logo_hide: int = 40
     pip_slots: list[dict[str, Any]] = field(default_factory=list)
+    yt_secrets_path: str = "data/client_secrets.json"
+    yt_token_path: str = "data/yt_token.json"
     break_enabled: bool = True
     break_image: str = ""
     break_text: str = "سنعود قريباً"
@@ -234,6 +242,8 @@ class RelayConfig:
             logo_show=max(1, min(3600, int(number(data.get("logo_show", 12), 12)))),
             logo_hide=max(1, min(3600, int(number(data.get("logo_hide", 40), 40)))),
             pip_slots=sanitize_pip_slots(data.get("pip_slots", [])),
+            yt_secrets_path=str(data.get("yt_secrets_path", "data/client_secrets.json")).strip() or "data/client_secrets.json",
+            yt_token_path=str(data.get("yt_token_path", "data/yt_token.json")).strip() or "data/yt_token.json",
             break_enabled=bool(data.get("break_enabled", True)),
             break_image=str(data.get("break_image", "")).strip(),
             break_text=str(data.get("break_text", "سنعود قريباً")).strip() or "سنعود قريباً",
@@ -1516,6 +1526,69 @@ def public_config(config: RelayConfig) -> dict[str, Any]:
     return data
 
 
+# ============================= YouTube Data API (بيانات البث) =============================
+YT_FLOW: Optional["yt.DeviceFlow"] = None  # تدفق تفويض معلّق (رابط + رمز)
+
+
+def _yt_path(config: RelayConfig, key: str) -> Path:
+    value = str(getattr(config, key) or "").strip()
+    p = Path(value)
+    return p if p.is_absolute() else (APP_DIR / p)
+
+
+def _yt_secrets(config: RelayConfig) -> Optional[dict[str, Any]]:
+    if yt is None:
+        return None
+    try:
+        return yt.load_client_secrets(_yt_path(config, "yt_secrets_path"))
+    except Exception as exc:
+        LOGGER.warning("client_secrets غير صالح: %s", exc)
+        return None
+
+
+def _yt_token_store(config: RelayConfig) -> Optional["yt.YouTubeTokenStore"]:
+    if yt is None:
+        return None
+    return yt.YouTubeTokenStore(_yt_path(config, "yt_token_path"))
+
+
+def _yt_client(config: RelayConfig) -> Optional["yt.YouTubeClient"]:
+    """يعيد عميلاً برمز وصول سليم أو None (مع رسالة سبب)."""
+    if yt is None:
+        return None
+    secrets = _yt_secrets(config)
+    if not secrets:
+        return None
+    store = _yt_token_store(config)
+    if store is None:
+        return None
+    try:
+        token = store.access_token(secrets["client_id"], secrets["client_secret"], secrets["token_uri"])
+    except yt.YouTubeApiError as exc:
+        LOGGER.warning("تعذر تجديد رمز يوتيوب: %s", exc)
+        token = None
+    if not token:
+        return None
+    return yt.YouTubeClient(token)
+
+
+def _yt_broadcast(config: RelayConfig) -> tuple[Optional["yt.YouTubeClient"], Optional[dict[str, Any]], Optional[str]]:
+    """يربط مفتاح البث الأول بالبث الحي إن وُجد. يعيد (عميل، بث، رسالة خطأ)."""
+    client = _yt_client(config)
+    if client is None:
+        return None, None, "اربط حساب يوتيوب أولاً (زر التفويض أدناه)"
+    keys = config.stream_keys
+    if not keys:
+        return client, None, "لا توجد مفاتيح بث — أضف مفتاحاً أولاً لربطه ببث يوتيوب"
+    try:
+        broadcast = client.find_broadcast_for_key(keys[0])
+    except yt.YouTubeApiError as exc:
+        return client, None, f"خطأ من يوتيوب: {exc}"
+    if not broadcast:
+        return client, None, f"لم أجد بثاً مباشراً مرتبطاً بالمفتاح الأول — تأكد أن البث مفعّل «Go live» في الاستوديو"
+    return client, broadcast, None
+
+
 HTML = r'''<!doctype html>
 <html lang="ar" dir="rtl">
 <head>
@@ -1536,6 +1609,7 @@ HTML = r'''<!doctype html>
 <div class="card"><div class="card-head"><h2>الوجهات</h2><span class="label">تحكم فردي بكل وجهة — المفاتيح مخفية</span></div><div id="workers" class="worker-list"><div class="worker-msg">لا توجد وجهات قيد التشغيل.</div></div></div>
 <div class="card"><div class="card-head"><h2>أدوات التحكم</h2><span class="label">كل شيء من هنا</span></div><div class="actions"><button id="refreshSourceBtn" class="btn">تحديث المصدر الآن</button><button id="breakStartBtn" class="btn">تشغيل شاشة الاستراحة</button><button id="breakStopBtn" class="btn">إيقاف شاشة الاستراحة</button><button id="testWebhookBtn" class="btn">اختبار Webhook</button><div id="liveCtl" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px"></div><button id="downloadLogBtn" class="btn">تنزيل السجل الكامل</button><button id="restartAppBtn" class="btn danger">إعادة تشغيل التطبيق</button></div><div class="row" style="margin-top:16px"><div class="field"><label for="log_level">مستوى السجل</label><select id="log_level"><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select><small>يُطبق فوراً ويُحفظ مع الإعدادات.</small></div><div class="field"><label for="new_token">تغيير رمز اللوحة</label><input id="current_token" type="password" placeholder="الرمز الحالي (إن وُجد)" autocomplete="off"><input id="new_token" type="password" placeholder="رمز جديد — 6 أحرف فأكثر" autocomplete="new-password"><small>يُحفظ في config.json ويُطلب عند الدخول التالي.</small></div></div><div class="actions"><button id="applyLogLevelBtn" class="btn">تطبيق مستوى السجل</button><button id="changeTokenBtn" class="btn primary">تغيير الرمز</button></div></div>
 <div class="card full"><div class="card-head"><h2>الإعدادات</h2><span class="label">يمكن الحفظ أثناء التشغيل — يُعاد تشغيل البث تلقائياً لتطبيق التغييرات</span></div><form id="configForm"><div class="row"><div class="field"><label for="source_url">رابط المصدر الرئيسي</label><input id="source_url" name="source_url" type="url" required><small>رابط بث YouTube أو صفحة /live للقناة.</small></div><div class="field"><label for="rtmp_base">عنوان RTMP الأساسي</label><input id="rtmp_base" name="rtmp_base" type="url" required><small>مثال: rtmp://a.rtmp.youtube.com/live2</small></div></div><div class="field"><label for="backup_sources">مصادر احتياطية اختيارية</label><textarea id="backup_sources" name="backup_sources" placeholder="ضع رابطاً في كل سطر"></textarea><small>إذا تعذر المصدر الرئيسي، يجرب التطبيق هذه الروابط بالترتيب تلقائياً.</small></div><div class="field"><label for="stream_keys">مفاتيح البث</label><textarea id="stream_keys" name="stream_keys" placeholder="ضع مفتاحاً في كل سطر أو افصل بينها بفواصل"></textarea><small id="keysHint">إذا كان هناك مفتاح محفوظ، اترك الحقل فارغاً للإبقاء عليه. لا يظهر المفتاح بعد الحفظ.</small></div><div class="row"><div class="field"><label for="resolution">الدقة</label><select id="resolution" name="resolution"><option>1920x1080</option><option>1280x720</option><option>854x480</option><option>640x360</option></select></div><div class="field"><label for="fps">الإطارات في الثانية</label><input id="fps" name="fps" type="number" min="1" max="120"></div></div><div class="row"><div class="field"><label for="video_bitrate">معدل الفيديو</label><input id="video_bitrate" name="video_bitrate" placeholder="3000k"></div><div class="field"><label for="audio_bitrate">معدل الصوت</label><input id="audio_bitrate" name="audio_bitrate" placeholder="160k"></div></div><div class="row"><div class="field"><label for="reconnect_delay">أول تأخير بين المحاولات (ثانية)</label><input id="reconnect_delay" name="reconnect_delay" type="number" min="3" max="300"></div><div class="field"><label for="max_reconnect_delay">أقصى تأخير تلقائي (ثانية)</label><input id="max_reconnect_delay" name="max_reconnect_delay" type="number" min="3" max="900"></div></div><div class="row"><div class="field"><label for="health_timeout">مهلة صحة البث (ثانية)</label><input id="health_timeout" name="health_timeout" type="number" min="15" max="600"><small>إذا صمت ffmpeg تماماً أكثر من هذه المدة يُعاد تشغيل البث.</small></div><div class="field"><label for="stall_timeout">مهلة انقطاع البيانات (ثانية)</label><input id="stall_timeout" name="stall_timeout" type="number" min="10" max="300"><small>إذا توقف تقدّم البيانات — أو لم يظهر أول إطار عند الإقلاع — أكثر من هذه المهلة يُعاد الاتصال برابط جديد فوراً قبل أن تظهر رسالة «لا تتوفّر بيانات» في يوتيوب. الموصى: 15.</small></div></div><div class="row"><div class="field"><label for="preset">سرعة ترميز x264</label><select id="preset" name="preset"><option>ultrafast</option><option>superfast</option><option>veryfast</option><option>faster</option><option>fast</option><option>medium</option><option>slow</option></select><small>على خادم ضعيف اختر faster أو fast حتى لا يتأخر الترميز عن الزمن الحقيقي (سبب رسالة «البيانات غير كافية»).</small></div><div class="field"><label for="max_session_minutes">تجديد رابط المصدر كل (دقيقة)</label><input id="max_session_minutes" name="max_session_minutes" type="number" min="0" max="720"><small>روابط بث يوتيوب تنتهي صلاحيتها أثناء العمل؛ يُجدد الرابط تلقائياً قبل موته. 0 = تعطيل. الموصى: 120.</small></div></div><div class="row"><div class="field"><label for="cookies_from_browser">مصدر Cookies اختياري</label><input id="cookies_from_browser" name="cookies_from_browser" placeholder="chrome أو chrome:Default"><small>اتركه فارغاً إلا إذا كان المصدر يحتاج تسجيل دخول.</small></div><div class="field"><label for="cookiefile">ملف Cookies اختياري</label><input id="cookiefile" name="cookiefile" placeholder="/path/to/cookies.txt"></div></div><div class="row"><div class="field"><label for="proxy">بروكسي اختياري (http/https)</label><input id="proxy" name="proxy" placeholder="http://user:pass@host:3128"><small>استخدمه إذا كانت يوتيوب تحجب مقاطع الفيديو عن IP الخادم (أخطاء 403 في السجل). اتركه فارغاً للإبقاء على القيمة الحالية.</small></div><div class="field"><label class="check" style="margin-top:26px"><input id="clear_proxy" type="checkbox"> حذف البروكسي الحالي عند الحفظ</label><small>فعّله فقط إذا أردت إزالة بروكسي محفوظ نهائياً.</small></div></div><div class="row"><div class="field"><label for="logo_path">شعار البث (صورة PNG بخلفية شفافة)</label><input id="logo_path" name="logo_path" placeholder="/opt/yoteblive/media/logo.png"><small>مسار صورة على الخادم. تُعرض فوق البث في زاوية الشاشة. اتركها فارغة لإيقاف الشعار.</small></div><div class="field"><label for="logo_mode">وضع الشعار</label><select id="logo_mode" name="logo_mode"><option value="off">متوقف</option><option value="always">دائم</option><option value="periodic">دوري (يظهر ثم يختفي)</option></select><small>الدوري يظهر الشعار logo_show ثانية كل (logo_show + logo_hide) ثانية.</small></div></div><div class="row"><div class="field"><label for="logo_position">موضع الشعار</label><select id="logo_position" name="logo_position"><option value="tl">أعلى يسار</option><option value="tr">أعلى يمين</option><option value="bl">أسفل يسار</option><option value="br">أسفل يمين</option><option value="center">الوسط</option></select></div><div class="field"><label for="logo_width">عرض الشعار بالبكسل (0 = تلقائي)</label><input id="logo_width" name="logo_width" type="number" min="0" max="2000"><small>يُصغَّر تلقائياً إن كانت الصورة أكبر.</small></div></div><div class="row"><div class="field"><label for="logo_show">مدة الظهور (ثانية)</label><input id="logo_show" name="logo_show" type="number" min="1" max="3600"></div><div class="field"><label for="logo_hide">مدة الاختفاء (ثانية)</label><input id="logo_hide" name="logo_hide" type="number" min="1" max="3600"></div></div><div class="field"><label for="pip_slots">منافذ العرض (PiP) — صورة/فيديو تُعرض فوق البث</label><textarea id="pip_slots" name="pip_slots" placeholder='{"name":"صورة الموضوع","path":"/opt/yoteblive/media/subject.png","position":"br","width":480,"mode":"periodic","show":20,"hide":30}'></textarea><small>سطر JSON واحد لكل منفذ (حتى 3). الوضع: off/always/periodic. مثال: صورة تعرضها عند حديث المتحدث عنها. الفيديو بصيغ mp4/mkv/webm. تُطبق التغييرات عند الحفظ (إعادة تشغيل البث).</small></div><div class="field"><label for="break_text">شاشة الاستراحة — النص (يظهر عند انقطاع المصدر)</label><input id="break_text" name="break_text" placeholder="سنعود قريباً"></div><div class="row"><div class="field"><label for="break_image">صورة خلفية الاستراحة (اختياري)</label><input id="break_image" name="break_image" placeholder="/opt/yoteblive/media/break.png"><small>فارغة = خلفية داكنة بنص عربي.</small></div><div class="field"><label for="break_audio">ملف صوت خلفية (اختياري)</label><input id="break_audio" name="break_audio" placeholder="/opt/yoteblive/media/break.mp3"><small>فارغ = صمت. mp3/m4a/aac.</small></div></div><label class="check"><input id="break_enabled" name="break_enabled" type="checkbox"> تفعيل البث البديل تلقائياً عند انقطاع المصدر (يمنع رسالة «سينتهي البث» في يوتيوب)</label><div class="field"><label for="notify_webhook">رابط إشعارات Webhook اختياري</label><input id="notify_webhook" name="notify_webhook" type="url" placeholder="https://discord.com/api/webhooks/..."><small>يصلك إشعار عند بدء البث، تحويل المصدر الاحتياطي، توقف التدفق، أو تكرار الفشل. يدعم Discord وSlack وntfy وأي نقطة تقبل JSON.</small></div><label class="check"><input id="auto_start" name="auto_start" type="checkbox"> تشغيل تلقائي عند تشغيل التطبيق</label><div class="actions"><button class="btn primary" type="submit">حفظ الإعدادات</button><button class="btn" type="button" id="testSourceBtn">اختبار المصدر</button><button class="btn ghost" type="button" id="clearKeysBtn">حذف المفاتيح المحفوظة</button></div></form></div>
+<div class="card full"><div class="card-head"><h2>إدارة بيانات بث يوتيوب (العنوان/الوصف/الكلمات المفتاحية)</h2><span id="ytBadge" class="badge">…</span></div><div id="ytBody"><div class="worker-msg">جاري الفحص…</div></div></div>
 <div class="card full"><div class="card-head"><h2>سجل التشغيل</h2><button class="btn ghost" id="clearLogBtn">مسح العرض</button></div><div id="logs" class="logbox">جاري تحميل السجل…</div></div>
 </section><div class="footer">الواجهة تعمل على المنفذ __PORT__ — تحديث الحالة كل 3 ثوانٍ</div>
 </main>
@@ -1552,6 +1626,20 @@ function notice(msg,type='ok'){let n=$('notice');n.textContent=msg;n.className=`
 async function api(url,options={},retry=true){let headers={'Content-Type':'application/json',...(options.headers||{})};if(panelToken)headers['X-Panel-Token']=panelToken;let r=await fetch(url,{...options,headers});let d=await r.json().catch(()=>({message:'رد غير صالح'}));if(r.status===401&&retry){let t=prompt('أدخل رمز الدخول للوحة التحكم:');if(t!==null){panelToken=t.trim();localStorage.setItem('panelToken',panelToken);return api(url,options,false)}}if(!r.ok)throw new Error(d.message||d.error||'حدث خطأ');return d}
 function stateLabel(s){return ({running:'يعمل',resolving:'يبحث عن المصدر',waiting:'ينتظر البث',reconnecting:'يعيد الاتصال',error:'خطأ',stopped:'متوقف'})[s]||s||'متوقف'}
 function renderStatus(d){let active=d.running,states=(d.workers||[]).map(w=>w.state),hasError=states.includes('error'),waiting=states.some(s=>['waiting','resolving','reconnecting'].includes(s));$('statusText').textContent=active?(hasError?'يعمل مع خطأ مؤقت':waiting?'ينتظر المصدر':'البث يعمل'):'متوقف';$('statusDot').className=`dot ${active?(hasError?'bad':waiting?'warn':'live'):''}`;$('mainState').textContent=active?(hasError?'خطأ مؤقت':waiting?'إعادة اتصال':'يعمل'):'متوقف';$('workerCount').textContent=d.worker_count||0;$('uptime').textContent=duration(d.uptime_seconds);$('startBtn').disabled=active;$('stopBtn').disabled=!active;$('restartBtn').disabled=!active&&!(lastConfig&&lastConfig.has_stream_keys);let box=$('workers');if(!d.workers?.length){box.innerHTML='<div class="worker-msg">لا توجد وجهات قيد التشغيل.</div>';return}box.innerHTML=d.workers.map(w=>{let stats='',chart='',alive=w.state!=='stopped';if(w.state==='running'&&(w.stats_fps||w.stats_bitrate||w.stats_speed)){stats=`<br>⚡ ${esc(w.stats_fps||'—')} fps — ${esc(w.stats_bitrate||'—')} — سرعة ${esc(w.stats_speed||'—')}${w.stats_frame?` — ${w.stats_frame} إطار`:''}${w.stats_out_time?` — ${esc(w.stats_out_time)}`:''}`;let kb=parseKbps(w.stats_bitrate);if(kb!==null){(chartData[w.name]=chartData[w.name]||[]).push(kb);if(chartData[w.name].length>CHART_MAX)chartData[w.name].shift();chart=`<canvas class="chart" id="chart-${esc(w.name)}" width="280" height="44"></canvas>`}}let btn=alive?`<button class="btn danger wbtn" data-act="stop" data-name="${esc(w.name)}">إيقاف</button>`:`<button class="btn primary wbtn" data-act="start" data-name="${esc(w.name)}">تشغيل</button>`;let fb=w.fallback_running?`<span class="badge waiting">▶ استراحة تعمل</span>`:'';return `<div class="worker"><div class="worker-top"><span class="worker-name">${esc(w.name)}</span><span style="display:flex;gap:8px;align-items:center">${fb}<span class="badge ${esc(w.state)}">${esc(stateLabel(w.state))}</span>${btn}</span></div><div class="worker-msg">${esc(w.message)}${w.last_source?`<br>المصدر: ${esc(w.last_source)}`:''}${stats}${w.attempts?`<br>المحاولات: ${w.attempts} — مدة التشغيل: ${duration(w.uptime_seconds)}`:''}</div>${chart}</div>`}).join('');d.workers.forEach(w=>drawChart(w.name));box.querySelectorAll('.wbtn').forEach(b=>b.onclick=async()=>{b.disabled=true;try{let r=await api('/api/worker/'+b.dataset.act,{method:'POST',body:JSON.stringify({name:b.dataset.name})});notice(r.message)}catch(e){notice(e.message,'error')}finally{refresh()}})}
+function ytEscape(s){return esc(s)}
+function ytRender(s){
+  let badge=$('ytBadge'),body=$('ytBody');if(!badge||!body)return;
+  badge.textContent=s.ready?(s.linked?'مربوط ✓':'غير مربوط'):'غير جاهز';
+  badge.className='badge '+(s.linked?'running':'waiting');
+  if(!s.ready){body.innerHTML=`<div class="worker-msg">ضع ملف <b>client_secrets.json</b> (من Google Cloud) في: <code>${esc(s.secrets_path||'data/client_secrets.json')}</code> ثم أعد تحميل الصفحة.</div>`;return}
+  if(!s.linked){body.innerHTML=`<div class="worker-msg">اربط حساب يوتيوب مرة واحدة ليتيح للتطبيق تعديل عنوان البث ووصفه وكلماته المفتاحية (نطاق youtube فقط، لا يلمس محتواك).</div><div class="actions" style="margin-top:8px"><button class="btn primary" id="ytDevBtn">1) الحصول على رابط التفويض</button></div><div id="ytDevBox" class="worker-msg" style="margin-top:8px"></div>`;$('ytDevBtn').onclick=async()=>{try{let d=await api('/api/yt/device');$('ytDevBox').innerHTML=`افتح الرابط من أي جهاز وسجّل الدخول بيوتيوب ثم أدخل الرمز: <b style="font-size:20px">${ytEscape(d.user_code)}</b><br>الرابط: <a href="${ytEscape(d.verification_url)}" target="_blank">${ytEscape(d.verification_url)}</a><br><button class="btn primary" id="ytPollBtn" style="margin-top:8px">2) تم — تحقق واربط</button>`;$('ytPollBtn').onclick=async()=>{try{let r=await api('/api/yt/poll');notice(r.message);ytRefresh()}catch(e){notice(e.message,'error')}}}catch(e){notice(e.message,'error')}};return}
+  let ch=s.channel?`القناة: ${ytEscape(s.channel.title||'')}`:'';
+  let b=s.broadcast;
+  body.innerHTML=`<div class="worker-msg">${ch?ch+'<br>':''}${b?`البث المرتبط بالمفتاح الأول — العنوان حالياً: <b>${ytEscape(b.title||'(بلا عنوان)')}</b> (${b.privacy_status||'?'})`:'<span class="badge waiting">لم يُعثر على بث مرتبط — يجب أن يكون البث في وضع مباشر</span>'}</div>`+
+  (b?`<div style="display:grid;gap:10px;margin-top:10px"><div class="field"><label>عنوان البث</label><input id="ytTitle" value="${ytEscape(b.title||'')}"></div><div class="field"><label>الوصف</label><textarea id="ytDesc" style="min-height:70px">${ytEscape(b.description||'')}</textarea></div><div class="field"><label>الكلمات المفتاحية (افصل بفواصل)</label><input id="ytTags" value="${ytEscape((b.tags||[]).join(', '))}"></div><div class="row"><div class="field"><label>الخصوصية</label><select id="ytPrivacy"><option value="">(إبقاء الحالية)</option><option value="public" ${b.privacy_status==='public'?'selected':''}>عام</option><option value="unlisted" ${b.privacy_status==='unlisted'?'selected':''}>غير مدرج</option><option value="private" ${b.privacy_status==='private'?'selected':''}>خاص</option></select></div><div class="field"><label>فئة (Category ID — اختياري)</label><input id="ytCategory" value="${ytEscape(b.category_id||'')}" placeholder="مثال: 20 = ألعاب، 24 = ترفيه، 25 = أخبار"></div></div><div class="actions"><button class="btn primary" id="ytSaveBtn">حفظ التعديلات على يوتيوب</button></div></div>`:'');
+  if(b){$('ytSaveBtn').onclick=async()=>{let btn=$('ytSaveBtn');btn.disabled=true;btn.textContent='جارٍ الحفظ…';try{let r=await api('/api/yt/update',{method:'POST',body:JSON.stringify({title:$('ytTitle').value,description:$('ytDesc').value,tags:$('ytTags').value,privacy_status:$('ytPrivacy').value,category_id:$('ytCategory').value})});notice(r.message);ytRefresh()}catch(e){notice(e.message,'error')}finally{btn.disabled=false;btn.textContent='حفظ التعديلات على يوتيوب'}}}
+}
+async function ytRefresh(){try{let s=await api('/api/yt/status');ytRender(s)}catch(e){let b=$('ytBody');if(b)b.innerHTML=`<div class="worker-msg">تعذر الاتصال بـ Google: ${esc(e.message)}</div>`}}
 function renderConfig(c){lastConfig=c;$('source_url').value=c.source_url||'';$('backup_sources').value=(c.backup_sources||[]).join('\n');$('rtmp_base').value=c.rtmp_base||'';$('resolution').value=c.resolution||'1280x720';$('fps').value=c.fps||30;$('video_bitrate').value=c.video_bitrate||'3000k';$('audio_bitrate').value=c.audio_bitrate||'160k';$('preset').value=c.preset||'veryfast';$('reconnect_delay').value=c.reconnect_delay||10;$('max_reconnect_delay').value=c.max_reconnect_delay||60;$('health_timeout').value=c.health_timeout||45;$('cookies_from_browser').value=c.cookies_from_browser||'';$('cookiefile').value=c.cookiefile||'';$('proxy').value=c.proxy||'';$('proxy').placeholder=c.has_proxy?'بروكسي محفوظ — اتركه فارغاً للإبقاء عليه':'http://user:pass@host:3128';$('clear_proxy').checked=false;$('logo_path').value=c.logo_path||'';$('logo_mode').value=c.logo_mode||'off';$('logo_position').value=c.logo_position||'br';$('logo_width').value=c.logo_width||0;$('logo_show').value=c.logo_show||12;$('logo_hide').value=c.logo_hide||40;$('pip_slots').value=(c.pip_slots||[]).map(x=>JSON.stringify(x)).join('\n');$('break_text').value=c.break_text||'سنعود قريباً';$('break_image').value=c.break_image||'';$('break_audio').value=c.break_audio||'';$('break_enabled').checked=!!c.break_enabled;$('notify_webhook').value=c.notify_webhook||'';$('log_level').value=c.log_level||'INFO';$('auto_start').checked=!!c.auto_start;$('keysHint').textContent=c.has_stream_keys?`يوجد ${c.stream_key_count} مفتاح محفوظ. اترك الحقل فارغاً للإبقاء عليه.`:'لا يوجد مفتاح محفوظ حالياً.'}
 async function refresh(){await refresh2()}
 $('configForm').addEventListener('submit',async e=>{e.preventDefault();let f=new FormData(e.target),keys=String(f.get('stream_keys')||'').trim();try{let d=await api('/api/config',{method:'POST',body:JSON.stringify({source_url:f.get('source_url'),backup_sources:String(f.get('backup_sources')||'').split(/[\n,]+/).map(x=>x.trim()).filter(Boolean),rtmp_base:f.get('rtmp_base'),stream_keys:keys?keys.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean):[],resolution:f.get('resolution'),fps:Number(f.get('fps')),video_bitrate:f.get('video_bitrate'),audio_bitrate:f.get('audio_bitrate'),preset:f.get('preset')||'veryfast',reconnect_delay:Number(f.get('reconnect_delay')),max_reconnect_delay:Number(f.get('max_reconnect_delay')),health_timeout:Number(f.get('health_timeout')),stall_timeout:Number(f.get('stall_timeout')),max_session_minutes:Number(f.get('max_session_minutes')),cookies_from_browser:f.get('cookies_from_browser'),cookiefile:f.get('cookiefile'),proxy:$('proxy').value.trim(),clear_proxy:$('clear_proxy').checked,logo_path:$('logo_path').value.trim(),logo_position:$('logo_position').value,logo_width:Number($('logo_width').value),logo_mode:$('logo_mode').value,logo_show:Number($('logo_show').value),logo_hide:Number($('logo_hide').value),pip_slots:$('pip_slots').value.split(/\n+/).map(x=>x.trim()).filter(Boolean).map(x=>JSON.parse(x)),break_enabled:$('break_enabled').checked,break_image:$('break_image').value.trim(),break_text:$('break_text').value.trim(),break_audio:$('break_audio').value.trim(),notify_webhook:f.get('notify_webhook'),auto_start:$('auto_start').checked,keep_keys:!keys})});renderConfig(d.config);$('stream_keys').value='';notice(d.message||'تم حفظ الإعدادات')}catch(e){notice(e.message,'error')}});
@@ -1563,7 +1651,7 @@ $('applyLogLevelBtn').onclick=async()=>{try{let d=await api('/api/log-level',{me
 $('changeTokenBtn').onclick=async()=>{let nt=$('new_token').value.trim();if(nt.length<6){notice('الرمز الجديد يجب أن يكون 6 أحرف على الأقل','error');return}try{let d=await api('/api/token',{method:'POST',body:JSON.stringify({current:$('current_token').value,new:nt})});panelToken=nt;localStorage.setItem('panelToken',nt);$('current_token').value='';$('new_token').value='';notice(d.message)}catch(e){notice(e.message,'error')}};
 $('downloadLogBtn').onclick=async()=>{try{let headers={};if(panelToken)headers['X-Panel-Token']=panelToken;let r=await fetch('/api/logs/download',{headers});if(!r.ok)throw new Error('تعذر تنزيل السجل');let blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='relay.log';a.click();URL.revokeObjectURL(a.href)}catch(e){notice(e.message,'error')}};
 $('restartAppBtn').onclick=async()=>{if(!confirm('إعادة تشغيل التطبيق بالكامل؟ سيتوقف البث ويعود حسب إعداد التشغيل التلقائي.'))return;try{await api('/api/app/restart',{method:'POST',body:'{}'});notice('جارٍ إعادة التشغيل… سيتم تحديث الصفحة تلقائياً');setTimeout(()=>location.reload(),6000)}catch(e){notice(e.message,'error')}};
-(async()=>{try{let c=await api('/api/config');renderConfig(c.config);await refresh();setInterval(refresh,3000)}catch(e){notice(e.message,'error')}})();
+(async()=>{try{let c=await api('/api/config');renderConfig(c.config);await refresh();ytRefresh();setInterval(refresh,3000)}catch(e){notice(e.message,'error')}})();
 </script>
 </body></html>'''
 
@@ -1671,6 +1759,34 @@ class AppHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if path == "/api/yt/status":
+            config = MANAGER.config
+            secrets_ok = _yt_secrets(config) is not None
+            secrets_path = str(_yt_path(config, "yt_secrets_path"))
+            token_store = _yt_token_store(config)
+            linked = bool(token_store and token_store.load())
+            result: dict[str, Any] = {"ready": secrets_ok, "linked": linked,
+                                      "secrets_path": secrets_path, "channel": None,
+                                      "broadcast": None, "message": ""}
+            if yt is None:
+                result["message"] = "وحدة yt_api غير متاحة"
+            elif not secrets_ok:
+                result["message"] = f"ضع ملف client_secrets.json في: {secrets_path}"
+            elif linked:
+                client = _yt_client(config)
+                if client:
+                    try:
+                        result["channel"] = client.channel_summary()
+                    except yt.YouTubeApiError as exc:
+                        result["message"] = f"تعذر قراءة القناة: {exc}"
+                    _, broadcast, err = _yt_broadcast(config)
+                    result["broadcast"] = yt.broadcast_summary(broadcast)
+                    result["message"] = err or ""
+                else:
+                    result["linked"] = False
+                    result["message"] = "رمز التفويض منتهي — أعد الربط (زر التفويض)"
+            self.send_json(result)
+            return
         self.send_json({"message": "غير موجود"}, 404)
 
     def do_POST(self) -> None:
@@ -1760,6 +1876,68 @@ class AppHandler(BaseHTTPRequestHandler):
                     "logo_show", "logo_hide", "pip_slots"} or k.startswith("pip_")}
                 ok, message, changed = MANAGER.apply_graphics_now(fields)
                 self.send_json({"ok": ok, "message": message, "changed": changed}, 200 if ok else 400)
+                return
+            if path == "/api/yt/device":
+                config = MANAGER.config
+                secrets = _yt_secrets(config)
+                if not secrets:
+                    self.send_json({"ok": False, "message": f"ضع ملف client_secrets.json في: {_yt_path(config, 'yt_secrets_path')}"}, 400)
+                    return
+                global YT_FLOW
+                try:
+                    YT_FLOW = yt.DeviceFlow(secrets["client_id"])
+                    info = YT_FLOW.start()
+                except yt.YouTubeApiError as exc:
+                    self.send_json({"ok": False, "message": f"تعذر بدء التفويض: {exc}"}, 400)
+                    return
+                self.send_json({"ok": True, **info})
+                return
+            if path == "/api/yt/poll":
+                config = MANAGER.config
+                secrets = _yt_secrets(config)
+                flow = YT_FLOW
+                if not secrets or flow is None:
+                    self.send_json({"ok": False, "message": "ابدأ التفويض أولاً"}, 400)
+                    return
+                try:
+                    token = flow.poll(secrets["client_secret"], secrets["token_uri"])
+                except yt.YouTubeApiError as exc:
+                    self.send_json({"ok": False, "message": str(exc)}, 400)
+                    return
+                token["issued_at"] = time.time()
+                store = _yt_token_store(config)
+                if store is None:
+                    self.send_json({"ok": False, "message": "لا يمكن حفظ الرمز"}, 400)
+                    return
+                store.save(token)
+                client = yt.YouTubeClient(token["access_token"])
+                channel = None
+                try:
+                    channel = client.channel_summary()
+                except Exception:
+                    pass
+                self.send_json({"ok": True, "message": "تم الربط بنجاح", "channel": channel})
+                return
+            if path == "/api/yt/update":
+                config = MANAGER.config
+                client, broadcast, error = _yt_broadcast(config)
+                if client is None or broadcast is None:
+                    self.send_json({"ok": False, "message": error or "تعذر الوصول لبث يوتيوب"}, 400)
+                    return
+                try:
+                    updated = client.update_broadcast(
+                        broadcast,
+                        title=str(data.get("title", "")).strip() or None,
+                        description=str(data.get("description", "")).strip() or None,
+                        tags=yt.parse_tags(data.get("tags", "")),
+                        category_id=str(data.get("category_id", "")).strip() or None,
+                        privacy_status=str(data.get("privacy_status", "")).strip() or None,
+                        made_for_kids=data.get("made_for_kids"),
+                    )
+                except yt.YouTubeApiError as exc:
+                    self.send_json({"ok": False, "message": f"خطأ من يوتيوب: {exc}"}, 400)
+                    return
+                self.send_json({"ok": True, "message": "تم تحديث بيانات البث بنجاح ✅", "broadcast": yt.broadcast_summary(updated)})
                 return
             if path == "/api/source/refresh":
                 MANAGER.resolver.invalidate()

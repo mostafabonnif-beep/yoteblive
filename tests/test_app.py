@@ -6,6 +6,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app  # noqa: E402
+import yt_api as app_yt  # noqa: E402
 
 
 def make_config(**overrides):
@@ -556,6 +557,96 @@ class TestLiveGfxControl:
         ok, msg, changed = manager.apply_graphics_now({"logo_mode": "periodic"})
         assert ok and manager.config.logo_mode == "periodic"
         assert "logo_mode" in changed
+
+
+
+class TestYouTubeApi:
+    def test_parse_tags(self):
+        assert app_yt.parse_tags("أ, ب\nأ") == ["أ", "ب"]
+        assert app_yt.parse_tags(["x", "x", "y"]) == ["x", "y"]
+        assert app_yt.parse_tags("") == []
+        assert len(app_yt.parse_tags(",".join(f"k{i}" for i in range(30)))) <= 15
+
+    def test_broadcast_summary_redacts_nothing_sensitive(self):
+        b = {"id": "abc", "snippet": {"title": "t", "description": "d", "tags": ["a"], "categoryId": "24"},
+             "status": {"privacyStatus": "unlisted", "lifeCycleStatus": "live", "selfDeclaredMadeForKids": False}}
+        summary = app_yt.broadcast_summary(b)
+        assert summary["id"] == "abc" and summary["title"] == "t" and summary["privacy_status"] == "unlisted"
+
+    def test_token_store_roundtrip_and_chmod(self, tmp_path):
+        store = app_yt.YouTubeTokenStore(tmp_path / "tok.json")
+        store.save({"access_token": "a", "refresh_token": "r", "expires_in": 3600, "issued_at": 0})
+        loaded = store.load()
+        assert loaded["access_token"] == "a"
+
+    def test_device_flow_poll_propagates_pending(self, monkeypatch):
+        flow = app_yt.DeviceFlow("cid")
+        flow.pending = {"device_code": "dc"}
+        monkeypatch.setattr(app_yt, "_http_post", lambda *a, **k: {"error": "authorization_pending", "error_description": "بانتظار الموافقة"})
+        import pytest as _pt
+        try:
+            flow.poll("cs", "https://x/token")
+            assert False
+        except app_yt.YouTubeApiError as exc:
+            assert "بانتظار" in str(exc)
+
+    def test_device_flow_poll_success(self, monkeypatch):
+        flow = app_yt.DeviceFlow("cid")
+        flow.pending = {"device_code": "dc"}
+        monkeypatch.setattr(app_yt, "_http_post", lambda *a, **k: {"access_token": "at", "refresh_token": "rt", "expires_in": 3600})
+        token = flow.poll("cs", "https://x/token")
+        assert token["access_token"] == "at"
+
+    def test_client_update_broadcast_body(self, monkeypatch):
+        client = app_yt.YouTubeClient("tok")
+        captured = {}
+
+        def fake_put(endpoint, payload, **query):
+            captured["endpoint"] = endpoint
+            captured["payload"] = payload
+            captured["query"] = query
+            return {"id": payload["id"], "snippet": payload["snippet"], "status": payload["status"], "contentDetails": payload["contentDetails"]}
+
+        monkeypatch.setattr(client, "_put", fake_put)
+        existing = {"id": "b1", "snippet": {"title": "old", "description": "d", "tags": ["a"], "categoryId": "1"},
+                    "status": {"privacyStatus": "private"}, "contentDetails": {"boundStreamId": "s1"}}
+        client.update_broadcast(existing, title="new", tags=["x"], privacy_status="public", made_for_kids=False)
+        body = captured["payload"]
+        assert body["snippet"]["title"] == "new"
+        assert body["status"]["privacyStatus"] == "public"
+        assert body["status"]["selfDeclaredMadeForKids"] is False
+        assert body["contentDetails"]["boundStreamId"] == "s1"
+        assert captured["query"] == {"part": "snippet,status,contentDetails"}
+
+    def test_find_broadcast_chain(self, monkeypatch):
+        client = app_yt.YouTubeClient("tok")
+        calls = []
+
+        def fake_get(endpoint, **query):
+            calls.append((endpoint, query))
+            if endpoint == "liveStreams":
+                return {"items": [{"id": "sid", "cdn": {"ingestionInfo": {"streamName": "the-key"}}}]}
+            return {"items": [{"id": "bid", "contentDetails": {"boundStreamId": "sid"},
+                               "snippet": {"title": "t"}, "status": {}}]}
+
+        monkeypatch.setattr(client, "_get", fake_get)
+        result = client.find_broadcast_for_key("the-key")
+        assert result["id"] == "bid"
+        # مفتاح مختلف: لا نطابق
+        assert client.live_stream_by_key("other") is None
+
+    def test_load_secrets_validates(self, tmp_path):
+        p = tmp_path / "cs.json"
+        p.write_text('{"installed": {"client_id": "id", "client_secret": "cs", "token_uri": "https://x"}}')
+        info = app_yt.load_client_secrets(p)
+        assert info["client_id"] == "id"
+        p.write_text('{"web": {"nope": 1}}')
+        import pytest as _pt2
+        try:
+            app_yt.load_client_secrets(p)
+            assert False
+        except ValueError:
+            pass
 
 
 class TestPanelTokenAndLogLevel:

@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 data/config.json
 data/*.log
+data/client_secrets.json
+data/yt_token.json
+data/*token*
