@@ -529,6 +529,35 @@ class TestGraphicsV9:
         assert "break_text" in public
 
 
+
+class TestLiveGfxControl:
+    def test_apply_config_merge_in_place(self):
+        cfg = app.RelayConfig.from_dict({"logo_mode": "off"})
+        changed = app.apply_config_merge(cfg, {"logo_mode": "periodic", "logo_show": 5, "bad_key": 1})
+        assert cfg.logo_mode == "periodic" and cfg.logo_show == 5
+        assert "logo_mode" in changed and "logo_show" in changed
+        assert "bad_key" not in changed
+
+    def test_apply_config_merge_keeps_rest(self):
+        cfg = app.RelayConfig.from_dict({"video_bitrate": "2500k", "logo_path": "/tmp/l.png"})
+        app.apply_config_merge(cfg, {"logo_mode": "always"})
+        assert cfg.video_bitrate == "2500k" and cfg.logo_path == "/tmp/l.png"
+
+    def test_request_restart_sets_event(self, monkeypatch):
+        manager = app.RelayManager(app.RelayConfig.from_dict({
+            "source_url": "https://example.com/live", "rtmp_base": "rtmp://x/live", "stream_keys": ["k"]}))
+        worker = app.RelayWorker(manager, "stream-1", "rtmp://x/live/k", manager.config)
+        worker.request_restart("اختبار")
+        assert worker._restart_evt.is_set()
+
+    def test_apply_graphics_now_no_workers(self):
+        manager = app.RelayManager(app.RelayConfig.from_dict({
+            "source_url": "https://example.com/live", "rtmp_base": "rtmp://x/live", "stream_keys": ["k"]}))
+        ok, msg, changed = manager.apply_graphics_now({"logo_mode": "periodic"})
+        assert ok and manager.config.logo_mode == "periodic"
+        assert "logo_mode" in changed
+
+
 class TestPanelTokenAndLogLevel:
     def test_panel_token_parsed(self):
         cfg = make_config(panel_token=" secret123 ")
