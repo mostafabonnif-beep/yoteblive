@@ -66,6 +66,11 @@ DEFAULTS = {
     "break_image": "",
     "break_text": "سنعود قريباً",
     "break_audio": "",
+    "yt_auto_title": False,
+    "yt_title_template": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "auto_update_ytdlp": True,
     "auto_start": False,
     "notify_webhook": "",
     "panel_token": "",
@@ -126,6 +131,11 @@ class RelayConfig:
     break_image: str = ""
     break_text: str = "سنعود قريباً"
     break_audio: str = ""
+    yt_auto_title: bool = False
+    yt_title_template: str = ""
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    auto_update_ytdlp: bool = True
     auto_start: bool = False
     notify_webhook: str = ""
     panel_token: str = ""
@@ -248,6 +258,11 @@ class RelayConfig:
             break_image=str(data.get("break_image", "")).strip(),
             break_text=str(data.get("break_text", "سنعود قريباً")).strip() or "سنعود قريباً",
             break_audio=str(data.get("break_audio", "")).strip(),
+            yt_auto_title=bool(data.get("yt_auto_title", False)),
+            yt_title_template=str(data.get("yt_title_template", "")).strip(),
+            telegram_bot_token=str(data.get("telegram_bot_token", "")).strip(),
+            telegram_chat_id=str(data.get("telegram_chat_id", "")).strip(),
+            auto_update_ytdlp=bool(data.get("auto_update_ytdlp", True)),
             auto_start=bool(data.get("auto_start", False)),
             notify_webhook=str(data.get("notify_webhook", "")).strip(),
             panel_token=str(data.get("panel_token", "")).strip(),
@@ -670,8 +685,8 @@ class Notifier:
         self._thread = threading.Thread(target=self._worker, name="notifier", daemon=True)
         self._thread.start()
 
-    def notify(self, event: str, message: str, url: str) -> None:
-        if not url:
+    def notify(self, event: str, message: str, url: str, telegram_token: str = "", telegram_chat: str = "") -> None:
+        if not url and not (telegram_token and telegram_chat):
             return
         key = (event, message)
         with self._lock:
@@ -679,23 +694,34 @@ class Notifier:
             if time.time() - last < self.DEDUP_SECONDS:
                 return
             self._recent[key] = time.time()
-        self._queue.put((event, message, url))
+        self._queue.put((event, message, url, telegram_token, telegram_chat))
 
     def _worker(self) -> None:
         while True:
-            event, message, url = self._queue.get()
+            event, message, url, telegram_token, telegram_chat = self._queue.get()
             payload = json.dumps({"text": message, "content": message, "event": event, "app": "youtube-live-relay"}).encode("utf-8")
-            for attempt in (1, 2):
+            if url:
+                for attempt in (1, 2):
+                    try:
+                        request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": "live-relay/3.0"})
+                        with urllib.request.urlopen(request, timeout=8) as response:
+                            response.read()
+                        break
+                    except Exception as exc:
+                        if attempt == 2:
+                            LOGGER.warning("تعذر إرسال الإشعار للـ Webhook: %s", exc)
+                        else:
+                            time.sleep(2)
+            if telegram_token and telegram_chat:
                 try:
-                    request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": "live-relay/3.0"})
-                    with urllib.request.urlopen(request, timeout=8) as response:
+                    body = json.dumps({"chat_id": telegram_chat, "text": message, "disable_web_page_preview": True}).encode("utf-8")
+                    request = urllib.request.Request(
+                        f"https://api.telegram.org/bot{telegram_token}/sendMessage",
+                        data=body, headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(request, timeout=10) as response:
                         response.read()
-                    break
                 except Exception as exc:
-                    if attempt == 2:
-                        LOGGER.warning("تعذر إرسال الإشعار: %s", exc)
-                    else:
-                        time.sleep(2)
+                    LOGGER.warning("تعذر إرسال إشعار تيليجرام: %s", exc)
 
 
 NOTIFIER = Notifier()
@@ -1149,6 +1175,8 @@ class RelayWorker(threading.Thread):
                     self.manager.notify("fallback", f"🔁 تحويل {self.name_value} إلى المصدر الاحتياطي: {source.source_url}")
                 command = build_ffmpeg_command(source, self.output_url, self.config)
                 LOGGER.info("[%s] بدء إعادة الإرسال للمصدر: %s (الوضع: %s)", self.name_value, source.title or "بدون عنوان", source.mode)
+                if self.config.yt_auto_title:
+                    self.manager.auto_update_broadcast(source.title or "")
                 creation_kwargs: dict[str, Any] = {
                     "stdin": subprocess.DEVNULL,
                     "stdout": subprocess.PIPE,
@@ -1362,7 +1390,8 @@ class RelayManager:
         return [f"{self.config.rtmp_base.rstrip('/')}/{key.lstrip('/')}" for key in self.config.stream_keys]
 
     def notify(self, event: str, message: str) -> None:
-        NOTIFIER.notify(event, message, self.config.notify_webhook)
+        NOTIFIER.notify(event, message, self.config.notify_webhook,
+                        self.config.telegram_bot_token, self.config.telegram_chat_id)
 
     def start(self) -> tuple[bool, str]:
         with self.lock:
@@ -1450,6 +1479,41 @@ class RelayManager:
             worker.request_restart("تغيير رسوم فوري")
         return True, "تم تطبيق تغيير الرسوم — البث يعود خلال ثوانٍ عبر شاشة الاستراحة", changed
 
+    def auto_update_broadcast(self, source_title: str) -> None:
+        """تحديث عنوان بث يوتيوب تلقائياً من اسم المصدر (خلفي، مع عتبة 5 دقائق)."""
+        cfg = self.config
+        if not cfg.yt_auto_title or not source_title:
+            return
+        threading.Thread(target=self._auto_update_worker, args=(source_title,), daemon=True).start()
+
+    def _auto_update_worker(self, source_title: str) -> None:
+        cfg = self.config
+        now = time.time()
+        if not hasattr(self, "_yt_auto_lock"):
+            self._yt_auto_lock = threading.RLock()
+            self._yt_last_title = ""
+            self._yt_last_ts = 0.0
+        with self._yt_auto_lock:
+            if now - self._yt_last_ts < 300:
+                return
+            new_title = format_title_template(cfg.yt_title_template, source_title)
+            if new_title == self._yt_last_title:
+                return
+        client, broadcast, error = _yt_broadcast(cfg)
+        if client is None or broadcast is None:
+            LOGGER.info("[تلقائي] تعذر تحديث العنوان: %s", error or "لا بث مرتبط")
+            return
+        try:
+            client.update_broadcast(broadcast, title=new_title)
+        except yt.YouTubeApiError as exc:
+            LOGGER.warning("[تلقائي] فشل تحديث العنوان: %s", exc)
+            return
+        with self._yt_auto_lock:
+            self._yt_last_title = new_title
+            self._yt_last_ts = time.time()
+        LOGGER.info("[تلقائي] حُدّث عنوان البث في يوتيوب: %s", new_title)
+        self.notify("title_updated", f"🏷️ حُدّث عنوان البث تلقائياً: {new_title}")
+
     def break_all(self, action: str) -> tuple[bool, str]:
         """تشغيل/إيقاف شاشة الاستراحة يدوياً لكل الوجهات العاملة."""
         with self.lock:
@@ -1523,11 +1587,30 @@ def public_config(config: RelayConfig) -> dict[str, Any]:
     # إخفاء بيانات اعتماد البروكسي (user:pass) — الواجهة تعرض نسخة مقنّعة
     data["proxy"] = mask_proxy(config.proxy)
     data["has_proxy"] = bool(config.proxy)
+    data["telegram_bot_token"] = "••••••••" if config.telegram_bot_token else ""
+    data["has_telegram"] = bool(config.telegram_bot_token)
     return data
 
 
 # ============================= YouTube Data API (بيانات البث) =============================
 YT_FLOW: Optional["yt.DeviceFlow"] = None  # تدفق تفويض معلّق (رابط + رمز)
+
+
+def format_title_template(template: str, source_title: str) -> str:
+    """يطبق قالب العنوان: {title} = اسم المصدر. القالب الفارغ = الاسم نفسه."""
+    text = (template or "").strip()
+    title = (source_title or "").strip()[:100]
+    return text.replace("{title}", title) if text else title
+
+
+def ytdlp_update_due(marker: Path, now: float, interval_hours: int = 24) -> bool:
+    if not marker.exists():
+        return True
+    try:
+        last = float(marker.read_text(encoding="utf-8").strip() or 0)
+    except Exception:
+        return True
+    return now - last >= interval_hours * 3600
 
 
 def _yt_path(config: RelayConfig, key: str) -> Path:
@@ -1607,8 +1690,8 @@ HTML = r'''<!doctype html>
 <section class="grid">
 <div class="card"><div class="card-head"><h2>الحالة الآن</h2><span id="refreshLabel" class="label">تحديث تلقائي</span></div><div class="stats"><div class="stat"><span class="label">الحالة</span><b id="mainState">متوقف</b></div><div class="stat"><span class="label">الوجهات</span><b id="workerCount">0</b></div><div class="stat"><span class="label">مدة التشغيل</span><b id="uptime">00:00:00</b></div></div><div class="actions"><button id="startBtn" class="btn primary">تشغيل البث</button><button id="restartBtn" class="btn">إعادة تشغيل</button><button id="stopBtn" class="btn danger">إيقاف</button></div></div>
 <div class="card"><div class="card-head"><h2>الوجهات</h2><span class="label">تحكم فردي بكل وجهة — المفاتيح مخفية</span></div><div id="workers" class="worker-list"><div class="worker-msg">لا توجد وجهات قيد التشغيل.</div></div></div>
-<div class="card"><div class="card-head"><h2>أدوات التحكم</h2><span class="label">كل شيء من هنا</span></div><div class="actions"><button id="refreshSourceBtn" class="btn">تحديث المصدر الآن</button><button id="breakStartBtn" class="btn">تشغيل شاشة الاستراحة</button><button id="breakStopBtn" class="btn">إيقاف شاشة الاستراحة</button><button id="testWebhookBtn" class="btn">اختبار Webhook</button><div id="liveCtl" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px"></div><button id="downloadLogBtn" class="btn">تنزيل السجل الكامل</button><button id="restartAppBtn" class="btn danger">إعادة تشغيل التطبيق</button></div><div class="row" style="margin-top:16px"><div class="field"><label for="log_level">مستوى السجل</label><select id="log_level"><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select><small>يُطبق فوراً ويُحفظ مع الإعدادات.</small></div><div class="field"><label for="new_token">تغيير رمز اللوحة</label><input id="current_token" type="password" placeholder="الرمز الحالي (إن وُجد)" autocomplete="off"><input id="new_token" type="password" placeholder="رمز جديد — 6 أحرف فأكثر" autocomplete="new-password"><small>يُحفظ في config.json ويُطلب عند الدخول التالي.</small></div></div><div class="actions"><button id="applyLogLevelBtn" class="btn">تطبيق مستوى السجل</button><button id="changeTokenBtn" class="btn primary">تغيير الرمز</button></div></div>
-<div class="card full"><div class="card-head"><h2>الإعدادات</h2><span class="label">يمكن الحفظ أثناء التشغيل — يُعاد تشغيل البث تلقائياً لتطبيق التغييرات</span></div><form id="configForm"><div class="row"><div class="field"><label for="source_url">رابط المصدر الرئيسي</label><input id="source_url" name="source_url" type="url" required><small>رابط بث YouTube أو صفحة /live للقناة.</small></div><div class="field"><label for="rtmp_base">عنوان RTMP الأساسي</label><input id="rtmp_base" name="rtmp_base" type="url" required><small>مثال: rtmp://a.rtmp.youtube.com/live2</small></div></div><div class="field"><label for="backup_sources">مصادر احتياطية اختيارية</label><textarea id="backup_sources" name="backup_sources" placeholder="ضع رابطاً في كل سطر"></textarea><small>إذا تعذر المصدر الرئيسي، يجرب التطبيق هذه الروابط بالترتيب تلقائياً.</small></div><div class="field"><label for="stream_keys">مفاتيح البث</label><textarea id="stream_keys" name="stream_keys" placeholder="ضع مفتاحاً في كل سطر أو افصل بينها بفواصل"></textarea><small id="keysHint">إذا كان هناك مفتاح محفوظ، اترك الحقل فارغاً للإبقاء عليه. لا يظهر المفتاح بعد الحفظ.</small></div><div class="row"><div class="field"><label for="resolution">الدقة</label><select id="resolution" name="resolution"><option>1920x1080</option><option>1280x720</option><option>854x480</option><option>640x360</option></select></div><div class="field"><label for="fps">الإطارات في الثانية</label><input id="fps" name="fps" type="number" min="1" max="120"></div></div><div class="row"><div class="field"><label for="video_bitrate">معدل الفيديو</label><input id="video_bitrate" name="video_bitrate" placeholder="3000k"></div><div class="field"><label for="audio_bitrate">معدل الصوت</label><input id="audio_bitrate" name="audio_bitrate" placeholder="160k"></div></div><div class="row"><div class="field"><label for="reconnect_delay">أول تأخير بين المحاولات (ثانية)</label><input id="reconnect_delay" name="reconnect_delay" type="number" min="3" max="300"></div><div class="field"><label for="max_reconnect_delay">أقصى تأخير تلقائي (ثانية)</label><input id="max_reconnect_delay" name="max_reconnect_delay" type="number" min="3" max="900"></div></div><div class="row"><div class="field"><label for="health_timeout">مهلة صحة البث (ثانية)</label><input id="health_timeout" name="health_timeout" type="number" min="15" max="600"><small>إذا صمت ffmpeg تماماً أكثر من هذه المدة يُعاد تشغيل البث.</small></div><div class="field"><label for="stall_timeout">مهلة انقطاع البيانات (ثانية)</label><input id="stall_timeout" name="stall_timeout" type="number" min="10" max="300"><small>إذا توقف تقدّم البيانات — أو لم يظهر أول إطار عند الإقلاع — أكثر من هذه المهلة يُعاد الاتصال برابط جديد فوراً قبل أن تظهر رسالة «لا تتوفّر بيانات» في يوتيوب. الموصى: 15.</small></div></div><div class="row"><div class="field"><label for="preset">سرعة ترميز x264</label><select id="preset" name="preset"><option>ultrafast</option><option>superfast</option><option>veryfast</option><option>faster</option><option>fast</option><option>medium</option><option>slow</option></select><small>على خادم ضعيف اختر faster أو fast حتى لا يتأخر الترميز عن الزمن الحقيقي (سبب رسالة «البيانات غير كافية»).</small></div><div class="field"><label for="max_session_minutes">تجديد رابط المصدر كل (دقيقة)</label><input id="max_session_minutes" name="max_session_minutes" type="number" min="0" max="720"><small>روابط بث يوتيوب تنتهي صلاحيتها أثناء العمل؛ يُجدد الرابط تلقائياً قبل موته. 0 = تعطيل. الموصى: 120.</small></div></div><div class="row"><div class="field"><label for="cookies_from_browser">مصدر Cookies اختياري</label><input id="cookies_from_browser" name="cookies_from_browser" placeholder="chrome أو chrome:Default"><small>اتركه فارغاً إلا إذا كان المصدر يحتاج تسجيل دخول.</small></div><div class="field"><label for="cookiefile">ملف Cookies اختياري</label><input id="cookiefile" name="cookiefile" placeholder="/path/to/cookies.txt"></div></div><div class="row"><div class="field"><label for="proxy">بروكسي اختياري (http/https)</label><input id="proxy" name="proxy" placeholder="http://user:pass@host:3128"><small>استخدمه إذا كانت يوتيوب تحجب مقاطع الفيديو عن IP الخادم (أخطاء 403 في السجل). اتركه فارغاً للإبقاء على القيمة الحالية.</small></div><div class="field"><label class="check" style="margin-top:26px"><input id="clear_proxy" type="checkbox"> حذف البروكسي الحالي عند الحفظ</label><small>فعّله فقط إذا أردت إزالة بروكسي محفوظ نهائياً.</small></div></div><div class="row"><div class="field"><label for="logo_path">شعار البث (صورة PNG بخلفية شفافة)</label><input id="logo_path" name="logo_path" placeholder="/opt/yoteblive/media/logo.png"><small>مسار صورة على الخادم. تُعرض فوق البث في زاوية الشاشة. اتركها فارغة لإيقاف الشعار.</small></div><div class="field"><label for="logo_mode">وضع الشعار</label><select id="logo_mode" name="logo_mode"><option value="off">متوقف</option><option value="always">دائم</option><option value="periodic">دوري (يظهر ثم يختفي)</option></select><small>الدوري يظهر الشعار logo_show ثانية كل (logo_show + logo_hide) ثانية.</small></div></div><div class="row"><div class="field"><label for="logo_position">موضع الشعار</label><select id="logo_position" name="logo_position"><option value="tl">أعلى يسار</option><option value="tr">أعلى يمين</option><option value="bl">أسفل يسار</option><option value="br">أسفل يمين</option><option value="center">الوسط</option></select></div><div class="field"><label for="logo_width">عرض الشعار بالبكسل (0 = تلقائي)</label><input id="logo_width" name="logo_width" type="number" min="0" max="2000"><small>يُصغَّر تلقائياً إن كانت الصورة أكبر.</small></div></div><div class="row"><div class="field"><label for="logo_show">مدة الظهور (ثانية)</label><input id="logo_show" name="logo_show" type="number" min="1" max="3600"></div><div class="field"><label for="logo_hide">مدة الاختفاء (ثانية)</label><input id="logo_hide" name="logo_hide" type="number" min="1" max="3600"></div></div><div class="field"><label for="pip_slots">منافذ العرض (PiP) — صورة/فيديو تُعرض فوق البث</label><textarea id="pip_slots" name="pip_slots" placeholder='{"name":"صورة الموضوع","path":"/opt/yoteblive/media/subject.png","position":"br","width":480,"mode":"periodic","show":20,"hide":30}'></textarea><small>سطر JSON واحد لكل منفذ (حتى 3). الوضع: off/always/periodic. مثال: صورة تعرضها عند حديث المتحدث عنها. الفيديو بصيغ mp4/mkv/webm. تُطبق التغييرات عند الحفظ (إعادة تشغيل البث).</small></div><div class="field"><label for="break_text">شاشة الاستراحة — النص (يظهر عند انقطاع المصدر)</label><input id="break_text" name="break_text" placeholder="سنعود قريباً"></div><div class="row"><div class="field"><label for="break_image">صورة خلفية الاستراحة (اختياري)</label><input id="break_image" name="break_image" placeholder="/opt/yoteblive/media/break.png"><small>فارغة = خلفية داكنة بنص عربي.</small></div><div class="field"><label for="break_audio">ملف صوت خلفية (اختياري)</label><input id="break_audio" name="break_audio" placeholder="/opt/yoteblive/media/break.mp3"><small>فارغ = صمت. mp3/m4a/aac.</small></div></div><label class="check"><input id="break_enabled" name="break_enabled" type="checkbox"> تفعيل البث البديل تلقائياً عند انقطاع المصدر (يمنع رسالة «سينتهي البث» في يوتيوب)</label><div class="field"><label for="notify_webhook">رابط إشعارات Webhook اختياري</label><input id="notify_webhook" name="notify_webhook" type="url" placeholder="https://discord.com/api/webhooks/..."><small>يصلك إشعار عند بدء البث، تحويل المصدر الاحتياطي، توقف التدفق، أو تكرار الفشل. يدعم Discord وSlack وntfy وأي نقطة تقبل JSON.</small></div><label class="check"><input id="auto_start" name="auto_start" type="checkbox"> تشغيل تلقائي عند تشغيل التطبيق</label><div class="actions"><button class="btn primary" type="submit">حفظ الإعدادات</button><button class="btn" type="button" id="testSourceBtn">اختبار المصدر</button><button class="btn ghost" type="button" id="clearKeysBtn">حذف المفاتيح المحفوظة</button></div></form></div>
+<div class="card"><div class="card-head"><h2>أدوات التحكم</h2><span class="label">كل شيء من هنا</span></div><div class="actions"><button id="refreshSourceBtn" class="btn">تحديث المصدر الآن</button><button id="breakStartBtn" class="btn">تشغيل شاشة الاستراحة</button><button id="breakStopBtn" class="btn">إيقاف شاشة الاستراحة</button><button id="testWebhookBtn" class="btn">اختبار Webhook</button><button id="updateYtDlpBtn" class="btn">تحديث yt-dlp الآن</button><div id="liveCtl" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px"></div><button id="downloadLogBtn" class="btn">تنزيل السجل الكامل</button><button id="restartAppBtn" class="btn danger">إعادة تشغيل التطبيق</button></div><div class="row" style="margin-top:16px"><div class="field"><label for="log_level">مستوى السجل</label><select id="log_level"><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select><small>يُطبق فوراً ويُحفظ مع الإعدادات.</small></div><div class="field"><label for="new_token">تغيير رمز اللوحة</label><input id="current_token" type="password" placeholder="الرمز الحالي (إن وُجد)" autocomplete="off"><input id="new_token" type="password" placeholder="رمز جديد — 6 أحرف فأكثر" autocomplete="new-password"><small>يُحفظ في config.json ويُطلب عند الدخول التالي.</small></div></div><div class="actions"><button id="applyLogLevelBtn" class="btn">تطبيق مستوى السجل</button><button id="changeTokenBtn" class="btn primary">تغيير الرمز</button></div></div>
+<div class="card full"><div class="card-head"><h2>الإعدادات</h2><span class="label">يمكن الحفظ أثناء التشغيل — يُعاد تشغيل البث تلقائياً لتطبيق التغييرات</span></div><form id="configForm"><div class="row"><div class="field"><label for="source_url">رابط المصدر الرئيسي</label><input id="source_url" name="source_url" type="url" required><small>رابط بث YouTube أو صفحة /live للقناة.</small></div><div class="field"><label for="rtmp_base">عنوان RTMP الأساسي</label><input id="rtmp_base" name="rtmp_base" type="url" required><small>مثال: rtmp://a.rtmp.youtube.com/live2</small></div></div><div class="field"><label for="backup_sources">مصادر احتياطية اختيارية</label><textarea id="backup_sources" name="backup_sources" placeholder="ضع رابطاً في كل سطر"></textarea><small>إذا تعذر المصدر الرئيسي، يجرب التطبيق هذه الروابط بالترتيب تلقائياً.</small></div><div class="field"><label for="stream_keys">مفاتيح البث</label><textarea id="stream_keys" name="stream_keys" placeholder="ضع مفتاحاً في كل سطر أو افصل بينها بفواصل"></textarea><small id="keysHint">إذا كان هناك مفتاح محفوظ، اترك الحقل فارغاً للإبقاء عليه. لا يظهر المفتاح بعد الحفظ.</small></div><div class="row"><div class="field"><label for="resolution">الدقة</label><select id="resolution" name="resolution"><option>1920x1080</option><option>1280x720</option><option>854x480</option><option>640x360</option></select></div><div class="field"><label for="fps">الإطارات في الثانية</label><input id="fps" name="fps" type="number" min="1" max="120"></div></div><div class="row"><div class="field"><label for="video_bitrate">معدل الفيديو</label><input id="video_bitrate" name="video_bitrate" placeholder="3000k"></div><div class="field"><label for="audio_bitrate">معدل الصوت</label><input id="audio_bitrate" name="audio_bitrate" placeholder="160k"></div></div><div class="row"><div class="field"><label for="reconnect_delay">أول تأخير بين المحاولات (ثانية)</label><input id="reconnect_delay" name="reconnect_delay" type="number" min="3" max="300"></div><div class="field"><label for="max_reconnect_delay">أقصى تأخير تلقائي (ثانية)</label><input id="max_reconnect_delay" name="max_reconnect_delay" type="number" min="3" max="900"></div></div><div class="row"><div class="field"><label for="health_timeout">مهلة صحة البث (ثانية)</label><input id="health_timeout" name="health_timeout" type="number" min="15" max="600"><small>إذا صمت ffmpeg تماماً أكثر من هذه المدة يُعاد تشغيل البث.</small></div><div class="field"><label for="stall_timeout">مهلة انقطاع البيانات (ثانية)</label><input id="stall_timeout" name="stall_timeout" type="number" min="10" max="300"><small>إذا توقف تقدّم البيانات — أو لم يظهر أول إطار عند الإقلاع — أكثر من هذه المهلة يُعاد الاتصال برابط جديد فوراً قبل أن تظهر رسالة «لا تتوفّر بيانات» في يوتيوب. الموصى: 15.</small></div></div><div class="row"><div class="field"><label for="preset">سرعة ترميز x264</label><select id="preset" name="preset"><option>ultrafast</option><option>superfast</option><option>veryfast</option><option>faster</option><option>fast</option><option>medium</option><option>slow</option></select><small>على خادم ضعيف اختر faster أو fast حتى لا يتأخر الترميز عن الزمن الحقيقي (سبب رسالة «البيانات غير كافية»).</small></div><div class="field"><label for="max_session_minutes">تجديد رابط المصدر كل (دقيقة)</label><input id="max_session_minutes" name="max_session_minutes" type="number" min="0" max="720"><small>روابط بث يوتيوب تنتهي صلاحيتها أثناء العمل؛ يُجدد الرابط تلقائياً قبل موته. 0 = تعطيل. الموصى: 120.</small></div></div><div class="row"><div class="field"><label for="cookies_from_browser">مصدر Cookies اختياري</label><input id="cookies_from_browser" name="cookies_from_browser" placeholder="chrome أو chrome:Default"><small>اتركه فارغاً إلا إذا كان المصدر يحتاج تسجيل دخول.</small></div><div class="field"><label for="cookiefile">ملف Cookies اختياري</label><input id="cookiefile" name="cookiefile" placeholder="/path/to/cookies.txt"></div></div><div class="row"><div class="field"><label for="proxy">بروكسي اختياري (http/https)</label><input id="proxy" name="proxy" placeholder="http://user:pass@host:3128"><small>استخدمه إذا كانت يوتيوب تحجب مقاطع الفيديو عن IP الخادم (أخطاء 403 في السجل). اتركه فارغاً للإبقاء على القيمة الحالية.</small></div><div class="field"><label class="check" style="margin-top:26px"><input id="clear_proxy" type="checkbox"> حذف البروكسي الحالي عند الحفظ</label><small>فعّله فقط إذا أردت إزالة بروكسي محفوظ نهائياً.</small></div></div><div class="row"><div class="field"><label for="logo_path">شعار البث (صورة PNG بخلفية شفافة)</label><input id="logo_path" name="logo_path" placeholder="/opt/yoteblive/media/logo.png"><small>مسار صورة على الخادم. تُعرض فوق البث في زاوية الشاشة. اتركها فارغة لإيقاف الشعار.</small></div><div class="field"><label for="logo_mode">وضع الشعار</label><select id="logo_mode" name="logo_mode"><option value="off">متوقف</option><option value="always">دائم</option><option value="periodic">دوري (يظهر ثم يختفي)</option></select><small>الدوري يظهر الشعار logo_show ثانية كل (logo_show + logo_hide) ثانية.</small></div></div><div class="row"><div class="field"><label for="logo_position">موضع الشعار</label><select id="logo_position" name="logo_position"><option value="tl">أعلى يسار</option><option value="tr">أعلى يمين</option><option value="bl">أسفل يسار</option><option value="br">أسفل يمين</option><option value="center">الوسط</option></select></div><div class="field"><label for="logo_width">عرض الشعار بالبكسل (0 = تلقائي)</label><input id="logo_width" name="logo_width" type="number" min="0" max="2000"><small>يُصغَّر تلقائياً إن كانت الصورة أكبر.</small></div></div><div class="row"><div class="field"><label for="logo_show">مدة الظهور (ثانية)</label><input id="logo_show" name="logo_show" type="number" min="1" max="3600"></div><div class="field"><label for="logo_hide">مدة الاختفاء (ثانية)</label><input id="logo_hide" name="logo_hide" type="number" min="1" max="3600"></div></div><div class="field"><label for="pip_slots">منافذ العرض (PiP) — صورة/فيديو تُعرض فوق البث</label><textarea id="pip_slots" name="pip_slots" placeholder='{"name":"صورة الموضوع","path":"/opt/yoteblive/media/subject.png","position":"br","width":480,"mode":"periodic","show":20,"hide":30}'></textarea><small>سطر JSON واحد لكل منفذ (حتى 3). الوضع: off/always/periodic. مثال: صورة تعرضها عند حديث المتحدث عنها. الفيديو بصيغ mp4/mkv/webm. تُطبق التغييرات عند الحفظ (إعادة تشغيل البث).</small></div><div class="field"><label for="break_text">شاشة الاستراحة — النص (يظهر عند انقطاع المصدر)</label><input id="break_text" name="break_text" placeholder="سنعود قريباً"></div><div class="row"><div class="field"><label for="break_image">صورة خلفية الاستراحة (اختياري)</label><input id="break_image" name="break_image" placeholder="/opt/yoteblive/media/break.png"><small>فارغة = خلفية داكنة بنص عربي.</small></div><div class="field"><label for="break_audio">ملف صوت خلفية (اختياري)</label><input id="break_audio" name="break_audio" placeholder="/opt/yoteblive/media/break.mp3"><small>فارغ = صمت. mp3/m4a/aac.</small></div></div><label class="check"><input id="break_enabled" name="break_enabled" type="checkbox"> تفعيل البث البديل تلقائياً عند انقطاع المصدر (يمنع رسالة «سينتهي البث» في يوتيوب)</label><div class="field"><label for="notify_webhook">رابط إشعارات Webhook اختياري</label><input id="notify_webhook" name="notify_webhook" type="url" placeholder="https://discord.com/api/webhooks/..."><small>يصلك إشعار عند بدء البث، تحويل المصدر الاحتياطي، توقف التدفق، أو تكرار الفشل. يدعم Discord وSlack وntfy وأي نقطة تقبل JSON.</small></div><div class="row"><div class="field"><label for="telegram_bot_token">رمز بوت تيليجرام (إشعارات فورية لجوالك)</label><input id="telegram_bot_token" name="telegram_bot_token" placeholder="123456:ABC-DEF..."><small>أنشئ البوت عبر @BotFather. فارغ = الإبقاء على المحفوظ.</small></div><div class="field"><label for="telegram_chat_id">معرّف المحادثة (Chat ID)</label><input id="telegram_chat_id" name="telegram_chat_id" placeholder="-100123456789"><small>رسالة لأي بوت ثم @userinfobot يعطيك المعرّف.</small><label class="check" style="margin-top:4px"><input id="clearTelegram" type="checkbox"> حذف إعداد تيليجرام المحفوظ عند الحفظ</label></div></div><label class="check"><input id="yt_auto_title" name="yt_auto_title" type="checkbox"> تحديث عنوان بث يوتيوب تلقائياً من اسم المصدر (يتطلب الربط أولاً)</label><div class="row"><div class="field"><label for="yt_title_template">قالب العنوان</label><input id="yt_title_template" name="yt_title_template" placeholder="[بث] {title}"><small>{title} = اسم البث المصدر. مثال: قناة — {title}</small></div><div class="field"><label class="check" style="margin-top:18px"><input id="auto_update_ytdlp" name="auto_update_ytdlp" type="checkbox"> تحديث yt-dlp تلقائياً (مرة كل 24 ساعة)</label></div></div><label class="check"><input id="auto_start" name="auto_start" type="checkbox"> تشغيل تلقائي عند تشغيل التطبيق</label><div class="actions"><button class="btn primary" type="submit">حفظ الإعدادات</button><button class="btn" type="button" id="testSourceBtn">اختبار المصدر</button><button class="btn ghost" type="button" id="clearKeysBtn">حذف المفاتيح المحفوظة</button></div></form></div>
 <div class="card full"><div class="card-head"><h2>إدارة بيانات بث يوتيوب (العنوان/الوصف/الكلمات المفتاحية)</h2><span id="ytBadge" class="badge">…</span></div><div id="ytBody"><div class="worker-msg">جاري الفحص…</div></div></div>
 <div class="card full"><div class="card-head"><h2>سجل التشغيل</h2><button class="btn ghost" id="clearLogBtn">مسح العرض</button></div><div id="logs" class="logbox">جاري تحميل السجل…</div></div>
 </section><div class="footer">الواجهة تعمل على المنفذ __PORT__ — تحديث الحالة كل 3 ثوانٍ</div>
@@ -1640,12 +1723,12 @@ function ytRender(s){
   if(b){$('ytSaveBtn').onclick=async()=>{let btn=$('ytSaveBtn');btn.disabled=true;btn.textContent='جارٍ الحفظ…';try{let r=await api('/api/yt/update',{method:'POST',body:JSON.stringify({title:$('ytTitle').value,description:$('ytDesc').value,tags:$('ytTags').value,privacy_status:$('ytPrivacy').value,category_id:$('ytCategory').value})});notice(r.message);ytRefresh()}catch(e){notice(e.message,'error')}finally{btn.disabled=false;btn.textContent='حفظ التعديلات على يوتيوب'}}}
 }
 async function ytRefresh(){try{let s=await api('/api/yt/status');ytRender(s)}catch(e){let b=$('ytBody');if(b)b.innerHTML=`<div class="worker-msg">تعذر الاتصال بـ Google: ${esc(e.message)}</div>`}}
-function renderConfig(c){lastConfig=c;$('source_url').value=c.source_url||'';$('backup_sources').value=(c.backup_sources||[]).join('\n');$('rtmp_base').value=c.rtmp_base||'';$('resolution').value=c.resolution||'1280x720';$('fps').value=c.fps||30;$('video_bitrate').value=c.video_bitrate||'3000k';$('audio_bitrate').value=c.audio_bitrate||'160k';$('preset').value=c.preset||'veryfast';$('reconnect_delay').value=c.reconnect_delay||10;$('max_reconnect_delay').value=c.max_reconnect_delay||60;$('health_timeout').value=c.health_timeout||45;$('cookies_from_browser').value=c.cookies_from_browser||'';$('cookiefile').value=c.cookiefile||'';$('proxy').value=c.proxy||'';$('proxy').placeholder=c.has_proxy?'بروكسي محفوظ — اتركه فارغاً للإبقاء عليه':'http://user:pass@host:3128';$('clear_proxy').checked=false;$('logo_path').value=c.logo_path||'';$('logo_mode').value=c.logo_mode||'off';$('logo_position').value=c.logo_position||'br';$('logo_width').value=c.logo_width||0;$('logo_show').value=c.logo_show||12;$('logo_hide').value=c.logo_hide||40;$('pip_slots').value=(c.pip_slots||[]).map(x=>JSON.stringify(x)).join('\n');$('break_text').value=c.break_text||'سنعود قريباً';$('break_image').value=c.break_image||'';$('break_audio').value=c.break_audio||'';$('break_enabled').checked=!!c.break_enabled;$('notify_webhook').value=c.notify_webhook||'';$('log_level').value=c.log_level||'INFO';$('auto_start').checked=!!c.auto_start;$('keysHint').textContent=c.has_stream_keys?`يوجد ${c.stream_key_count} مفتاح محفوظ. اترك الحقل فارغاً للإبقاء عليه.`:'لا يوجد مفتاح محفوظ حالياً.'}
+function renderConfig(c){lastConfig=c;$('source_url').value=c.source_url||'';$('backup_sources').value=(c.backup_sources||[]).join('\n');$('rtmp_base').value=c.rtmp_base||'';$('resolution').value=c.resolution||'1280x720';$('fps').value=c.fps||30;$('video_bitrate').value=c.video_bitrate||'3000k';$('audio_bitrate').value=c.audio_bitrate||'160k';$('preset').value=c.preset||'veryfast';$('reconnect_delay').value=c.reconnect_delay||10;$('max_reconnect_delay').value=c.max_reconnect_delay||60;$('health_timeout').value=c.health_timeout||45;$('cookies_from_browser').value=c.cookies_from_browser||'';$('cookiefile').value=c.cookiefile||'';$('proxy').value=c.proxy||'';$('proxy').placeholder=c.has_proxy?'بروكسي محفوظ — اتركه فارغاً للإبقاء عليه':'http://user:pass@host:3128';$('clear_proxy').checked=false;$('logo_path').value=c.logo_path||'';$('logo_mode').value=c.logo_mode||'off';$('logo_position').value=c.logo_position||'br';$('logo_width').value=c.logo_width||0;$('logo_show').value=c.logo_show||12;$('logo_hide').value=c.logo_hide||40;$('pip_slots').value=(c.pip_slots||[]).map(x=>JSON.stringify(x)).join('\n');$('break_text').value=c.break_text||'سنعود قريباً';$('break_image').value=c.break_image||'';$('break_audio').value=c.break_audio||'';$('break_enabled').checked=!!c.break_enabled;$('notify_webhook').value=c.notify_webhook||'';$('telegram_bot_token').value=c.telegram_bot_token||'';$('telegram_chat_id').value=c.telegram_chat_id||'';$('telegram_chat_id').placeholder=c.has_telegram?'محفوظ — اتركه للإبقاء':'-100123456789';$('yt_auto_title').checked=!!c.yt_auto_title;$('yt_title_template').value=c.yt_title_template||'';$('auto_update_ytdlp').checked=c.auto_update_ytdlp!==false;$('log_level').value=c.log_level||'INFO';$('auto_start').checked=!!c.auto_start;$('keysHint').textContent=c.has_stream_keys?`يوجد ${c.stream_key_count} مفتاح محفوظ. اترك الحقل فارغاً للإبقاء عليه.`:'لا يوجد مفتاح محفوظ حالياً.'}
 async function refresh(){await refresh2()}
-$('configForm').addEventListener('submit',async e=>{e.preventDefault();let f=new FormData(e.target),keys=String(f.get('stream_keys')||'').trim();try{let d=await api('/api/config',{method:'POST',body:JSON.stringify({source_url:f.get('source_url'),backup_sources:String(f.get('backup_sources')||'').split(/[\n,]+/).map(x=>x.trim()).filter(Boolean),rtmp_base:f.get('rtmp_base'),stream_keys:keys?keys.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean):[],resolution:f.get('resolution'),fps:Number(f.get('fps')),video_bitrate:f.get('video_bitrate'),audio_bitrate:f.get('audio_bitrate'),preset:f.get('preset')||'veryfast',reconnect_delay:Number(f.get('reconnect_delay')),max_reconnect_delay:Number(f.get('max_reconnect_delay')),health_timeout:Number(f.get('health_timeout')),stall_timeout:Number(f.get('stall_timeout')),max_session_minutes:Number(f.get('max_session_minutes')),cookies_from_browser:f.get('cookies_from_browser'),cookiefile:f.get('cookiefile'),proxy:$('proxy').value.trim(),clear_proxy:$('clear_proxy').checked,logo_path:$('logo_path').value.trim(),logo_position:$('logo_position').value,logo_width:Number($('logo_width').value),logo_mode:$('logo_mode').value,logo_show:Number($('logo_show').value),logo_hide:Number($('logo_hide').value),pip_slots:$('pip_slots').value.split(/\n+/).map(x=>x.trim()).filter(Boolean).map(x=>JSON.parse(x)),break_enabled:$('break_enabled').checked,break_image:$('break_image').value.trim(),break_text:$('break_text').value.trim(),break_audio:$('break_audio').value.trim(),notify_webhook:f.get('notify_webhook'),auto_start:$('auto_start').checked,keep_keys:!keys})});renderConfig(d.config);$('stream_keys').value='';notice(d.message||'تم حفظ الإعدادات')}catch(e){notice(e.message,'error')}});
+$('configForm').addEventListener('submit',async e=>{e.preventDefault();let f=new FormData(e.target),keys=String(f.get('stream_keys')||'').trim();try{let d=await api('/api/config',{method:'POST',body:JSON.stringify({source_url:f.get('source_url'),backup_sources:String(f.get('backup_sources')||'').split(/[\n,]+/).map(x=>x.trim()).filter(Boolean),rtmp_base:f.get('rtmp_base'),stream_keys:keys?keys.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean):[],resolution:f.get('resolution'),fps:Number(f.get('fps')),video_bitrate:f.get('video_bitrate'),audio_bitrate:f.get('audio_bitrate'),preset:f.get('preset')||'veryfast',reconnect_delay:Number(f.get('reconnect_delay')),max_reconnect_delay:Number(f.get('max_reconnect_delay')),health_timeout:Number(f.get('health_timeout')),stall_timeout:Number(f.get('stall_timeout')),max_session_minutes:Number(f.get('max_session_minutes')),cookies_from_browser:f.get('cookies_from_browser'),cookiefile:f.get('cookiefile'),proxy:$('proxy').value.trim(),clear_proxy:$('clear_proxy').checked,clear_telegram:$('clearTelegram').checked||false,telegram_bot_token:$('telegram_bot_token').value.trim(),telegram_chat_id:$('telegram_chat_id').value.trim(),yt_auto_title:$('yt_auto_title').checked,yt_title_template:$('yt_title_template').value.trim(),auto_update_ytdlp:$('auto_update_ytdlp').checked,logo_path:$('logo_path').value.trim(),logo_position:$('logo_position').value,logo_width:Number($('logo_width').value),logo_mode:$('logo_mode').value,logo_show:Number($('logo_show').value),logo_hide:Number($('logo_hide').value),pip_slots:$('pip_slots').value.split(/\n+/).map(x=>x.trim()).filter(Boolean).map(x=>JSON.parse(x)),break_enabled:$('break_enabled').checked,break_image:$('break_image').value.trim(),break_text:$('break_text').value.trim(),break_audio:$('break_audio').value.trim(),notify_webhook:f.get('notify_webhook'),auto_start:$('auto_start').checked,keep_keys:!keys})});renderConfig(d.config);$('stream_keys').value='';notice(d.message||'تم حفظ الإعدادات')}catch(e){notice(e.message,'error')}});
 $('testSourceBtn').onclick=async()=>{let b=$('testSourceBtn');b.disabled=true;b.textContent='جارٍ الاختبار…';try{let d=await api('/api/test-source',{method:'POST',body:'{}'});notice(`المصدر صالح: ${d.title||'بدون عنوان'} — ${d.mode}`)}catch(e){notice(e.message,'error')}finally{b.disabled=false;b.textContent='اختبار المصدر'}};
 $('startBtn').onclick=async()=>{try{let d=await api('/api/start',{method:'POST',body:'{}'});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('stopBtn').onclick=async()=>{try{let d=await api('/api/stop',{method:'POST',body:'{}'});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('restartBtn').onclick=async()=>{try{let d=await api('/api/restart',{method:'POST',body:'{}'});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('clearKeysBtn').onclick=async()=>{if(!confirm('حذف جميع مفاتيح البث المحفوظة؟'))return;try{let d=await api('/api/config',{method:'POST',body:JSON.stringify({clear_keys:true})});renderConfig(d.config);notice('تم حذف المفاتيح')}catch(e){notice(e.message,'error')}};$('clearLogBtn').onclick=()=>{$('logs').textContent=''};
-$('refreshSourceBtn').onclick=async()=>{try{let d=await api('/api/source/refresh',{method:'POST',body:'{}'});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('breakStartBtn').onclick=async()=>{try{let d=await api('/api/break',{method:'POST',body:JSON.stringify({action:'start'})});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('breakStopBtn').onclick=async()=>{try{let d=await api('/api/break',{method:'POST',body:JSON.stringify({action:'stop'})});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};
+$('refreshSourceBtn').onclick=async()=>{try{let d=await api('/api/source/refresh',{method:'POST',body:'{}'});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('breakStartBtn').onclick=async()=>{try{let d=await api('/api/break',{method:'POST',body:JSON.stringify({action:'start'})});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('breakStopBtn').onclick=async()=>{try{let d=await api('/api/break',{method:'POST',body:JSON.stringify({action:'stop'})});notice(d.message);refresh()}catch(e){notice(e.message,'error')}};$('updateYtDlpBtn').onclick=async()=>{try{let d=await api('/api/update-ytdlp',{method:'POST',body:'{}'});notice(d.message);setTimeout(()=>location.reload(),8000)}catch(e){notice(e.message,'error')}};
 $('testWebhookBtn').onclick=async()=>{try{let d=await api('/api/webhook/test',{method:'POST',body:'{}'});notice(d.message)}catch(e){notice(e.message,'error')}};
 $('applyLogLevelBtn').onclick=async()=>{try{let d=await api('/api/log-level',{method:'POST',body:JSON.stringify({level:$('log_level').value})});notice(d.message)}catch(e){notice(e.message,'error')}};
 $('changeTokenBtn').onclick=async()=>{let nt=$('new_token').value.trim();if(nt.length<6){notice('الرمز الجديد يجب أن يكون 6 أحرف على الأقل','error');return}try{let d=await api('/api/token',{method:'POST',body:JSON.stringify({current:$('current_token').value,new:nt})});panelToken=nt;localStorage.setItem('panelToken',nt);$('current_token').value='';$('new_token').value='';notice(d.message)}catch(e){notice(e.message,'error')}};
@@ -1818,6 +1901,15 @@ class AppHandler(BaseHTTPRequestHandler):
                         incoming_proxy = str(data.get("proxy", "")).strip()
                         if not incoming_proxy or "•••" in incoming_proxy:
                             data["proxy"] = MANAGER.config.proxy
+                    # تيليجرام: نفس المنطق (الرمز سرّي)
+                    if data.get("clear_telegram"):
+                        data["telegram_bot_token"] = ""
+                        data["telegram_chat_id"] = ""
+                    else:
+                        incoming_tok = str(data.get("telegram_bot_token", "")).strip()
+                        if not incoming_tok or "••" in incoming_tok:
+                            data["telegram_bot_token"] = MANAGER.config.telegram_bot_token
+                            data["telegram_chat_id"] = MANAGER.config.telegram_chat_id
                     candidate = RelayConfig.from_dict({**asdict(MANAGER.config), **data})
                     errors = candidate.validate()
                     if errors:
@@ -1917,6 +2009,21 @@ class AppHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 self.send_json({"ok": True, "message": "تم الربط بنجاح", "channel": channel})
+                return
+            if path == "/api/update-ytdlp":
+                def _do_update_and_restart() -> None:
+                    try:
+                        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "yt-dlp"],
+                                       capture_output=True, text=True, timeout=600)
+                    except Exception as exc:
+                        LOGGER.warning("تعذر تحديث yt-dlp: %s", exc)
+                    (DATA_DIR / ".ytdlp_update").write_text(str(time.time()), encoding="utf-8")
+                    LOGGER.info("إعادة تشغيل لتطبيق yt-dlp المحدّث…")
+                    MANAGER.stop()
+                    time.sleep(1)
+                    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+                threading.Thread(target=_do_update_and_restart, daemon=True).start()
+                self.send_json({"ok": True, "message": "بدأ تحديث yt-dlp — سيعاد تشغيل التطبيق تلقائياً خلال ثوانٍ"})
                 return
             if path == "/api/yt/update":
                 config = MANAGER.config
@@ -2160,6 +2267,29 @@ def run_check(config: RelayConfig) -> int:
     return 0 if ok else 1
 
 
+def maybe_update_ytdlp(config: RelayConfig) -> None:
+    """تحديث yt-dlp تلقائياً: مرة كل 24 ساعة كحد أقصى (حتى لا يكسره يوتيوب)."""
+    if not config.auto_update_ytdlp:
+        return
+    marker = DATA_DIR / ".ytdlp_update"
+    if not ytdlp_update_due(marker, time.time()):
+        return
+
+    def _run() -> None:
+        try:
+            result = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "yt-dlp"],
+                                    capture_output=True, text=True, timeout=600)
+            if result.returncode == 0:
+                marker.write_text(str(time.time()), encoding="utf-8")
+                LOGGER.info("تم تحديث yt-dlp بنجاح — يسري بالكامل بعد إعادة تشغيل التطبيق القادمة")
+            else:
+                LOGGER.warning("فشل تحديث yt-dlp: %s", (result.stderr or result.stdout)[-300:])
+        except Exception as exc:
+            LOGGER.warning("تعذر تحديث yt-dlp: %s", exc)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def main() -> int:
     global FFMPEG, MANAGER, SERVER_PORT, PANEL_TOKEN
     parser = argparse.ArgumentParser(description="لوحة وإعادة إرسال بث مباشر تلقائية")
@@ -2180,6 +2310,7 @@ def main() -> int:
     config = RelayConfig.load()
     if args.check:
         return run_check(config)
+    maybe_update_ytdlp(config)
     if not args.token.strip() and config.panel_token:
         PANEL_TOKEN = config.panel_token
     if "LOG_LEVEL" not in os.environ and config.log_level:

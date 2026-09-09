@@ -6,6 +6,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app  # noqa: E402
+import urllib.request  # noqa: E402
 import yt_api as app_yt  # noqa: E402
 
 
@@ -647,6 +648,62 @@ class TestYouTubeApi:
             assert False
         except ValueError:
             pass
+
+
+
+class TestV11Enhancements:
+    def test_title_template(self):
+        assert app.format_title_template("", "مصدر حي") == "مصدر حي"
+        assert app.format_title_template("[بث] {title}", "مصدر حي") == "[بث] مصدر حي"
+        assert app.format_title_template("قناة — {title}", "x" * 300) == "قناة — " + "x" * 100
+
+    def test_ytdlp_update_due(self, tmp_path):
+        marker = tmp_path / "m"
+        assert app.ytdlp_update_due(marker, 1000) is True
+        marker.write_text(str(1000))
+        assert app.ytdlp_update_due(marker, 1000 + 3600) is False   # أقل من 24 ساعة
+        assert app.ytdlp_update_due(marker, 1000 + 24 * 3600 + 1) is True
+
+    def test_config_new_fields(self):
+        cfg = app.RelayConfig.from_dict({"yt_auto_title": True, "yt_title_template": "[بث] {title}",
+                                         "telegram_bot_token": "tok", "telegram_chat_id": "cid",
+                                         "auto_update_ytdlp": False})
+        assert cfg.yt_auto_title is True and cfg.telegram_bot_token == "tok"
+        assert cfg.auto_update_ytdlp is False
+
+    def test_public_config_masks_telegram(self):
+        cfg = app.RelayConfig.from_dict({"telegram_bot_token": "secret-tok", "telegram_chat_id": "cid"})
+        public = app.public_config(cfg)
+        assert "secret-tok" not in public["telegram_bot_token"]
+        assert public["has_telegram"] is True
+
+    def test_notifier_sends_telegram(self, monkeypatch):
+        import queue as q, threading as t
+        notifier = app.Notifier.__new__(app.Notifier)
+        notifier._queue = q.Queue()
+        notifier._recent = {}
+        notifier._lock = t.Lock()
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req.full_url)
+            class R:
+                def read(self):
+                    return b"{}"
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+            return R()
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        import threading as th
+        th.Thread(target=notifier._worker, daemon=True).start()
+        notifier.notify("started", "رسالة", "", "bot-token", "chat-1")
+        deadline = time.time() + 3
+        while not calls and time.time() < deadline:
+            time.sleep(0.05)
+        assert any("api.telegram.org/botbot-token" in c for c in calls)
 
 
 class TestPanelTokenAndLogLevel:
